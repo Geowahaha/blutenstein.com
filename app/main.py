@@ -7,6 +7,7 @@ import re
 import smtplib
 import sqlite3
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
@@ -14,7 +15,7 @@ from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -29,6 +30,20 @@ CUSTOMER_DB = Path(os.getenv("CUSTOMER_DB", "/data/customer_memory.sqlite3"))
 
 app = FastAPI(title="Blutenstein Portal", version="0.5.0")
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+
+# Simple in-memory rate limiter (per-IP)
+_rate_store: dict[str, list[float]] = defaultdict(list)
+RATE_LIMIT_WINDOW = 60.0  # seconds
+RATE_LIMIT_MAX = 5  # max submissions per window
+
+
+def _check_rate_limit(ip: str) -> None:
+    now = datetime.now(timezone.utc).timestamp()
+    window = _rate_store[ip]
+    window[:] = [t for t in window if now - t < RATE_LIMIT_WINDOW]
+    if len(window) >= RATE_LIMIT_MAX:
+        raise HTTPException(status_code=429, detail="ส่งเร็วเกินไป กรุณารอสักครู่แล้วลองใหม่")
+    window.append(now)
 
 
 class WaitlistLead(BaseModel):
@@ -469,6 +484,18 @@ async def line_webhook(request: Request):
 
 @app.post("/api/waitlist")
 async def waitlist(lead: WaitlistLead, request: Request):
+    # Honeypot: if website field is filled, it's a bot
+    body = await request.body()
+    try:
+        raw = json.loads(body)
+        if raw.get("website"):
+            return {"status": "ok", "message": "received"}  # silent discard
+    except Exception:
+        pass
+
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip)
+
     record = lead.model_dump()
     record.update({
         "created_at": now_iso(),
@@ -680,7 +707,7 @@ def successcasting_html() -> str:
 <script>
 function selectSku(sku,name){{document.getElementById('sku').value=sku; location.hash='order';}}
 const f=document.getElementById('orderForm'), r=document.getElementById('result');
-f.addEventListener('submit', async e=>{{e.preventDefault(); r.textContent='กำลังส่ง...'; const data=Object.fromEntries(new FormData(f).entries()); data.quantity=Number(data.quantity||1); try{{const res=await fetch('/api/successcasting/order',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(data)}}); const j=await res.json(); r.textContent=j.status==='ok'?(j.user_feedback || 'ส่งเข้าระบบแล้ว แจ้งทีมผ่าน LINE/Telegram สำเร็จ'):'ส่งไม่สำเร็จ'; if(j.status==='ok') f.reset();}}catch(err){{r.textContent='เชื่อมต่อไม่ได้ กรุณาลองใหม่';}} }});
+f.addEventListener('submit', async e=>{{e.preventDefault(); const btn=f.querySelector('button[type="submit"]'); btn.disabled=true; btn.textContent='กำลังส่ง...'; r.textContent=''; const data=Object.fromEntries(new FormData(f).entries()); data.quantity=Number(data.quantity||1); try{{const res=await fetch('/api/successcasting/order',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(data)}}); const j=await res.json(); r.textContent=j.status==='ok'?(j.user_feedback || 'ส่งเข้าระบบแล้ว แจ้งทีมผ่าน LINE/Telegram สำเร็จ'):'ส่งไม่สำเร็จ'; if(j.status==='ok') f.reset();}}catch(err){{r.textContent='เชื่อมต่อไม่ได้ กรุณาลองใหม่';}}finally{{btn.disabled=false; btn.textContent='ส่งคำสั่งซื้อเข้าระบบ';}} }});
 </script></body></html>"""
 
 @app.get("/", response_class=HTMLResponse)
@@ -695,6 +722,76 @@ def landing():
     return HTMLResponse(html)
 
 
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy_page():
+    return HTMLResponse(PRIVACY_HTML)
+
+
+@app.get("/terms", response_class=HTMLResponse)
+def terms_page():
+    return HTMLResponse(TERMS_HTML)
+
+
+PRIVACY_HTML = """<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Privacy Policy — Blutenstein</title>
+<style>body{max-width:780px;margin:40px auto;padding:0 24px;font-family:'Source Sans 3',system-ui,sans-serif;color:#061b31;line-height:1.7}h1{font-size:32px;letter-spacing:-.03em}h2{font-size:22px;margin-top:32px}a{color:#533afd}</style></head>
+<body>
+<h1>นโยบายความเป็นส่วนตัว</h1>
+<p><em>อัปเดตล่าสุด: 1 พฤษภาคม 2026</em></p>
+
+<h2>1. ข้อมูลที่เราเก็บ</h2>
+<p>เมื่อคุณกรอกฟอร์มบนเว็บไซต์ เราเก็บข้อมูลที่คุณให้โดยตรง: ชื่อ, บริษัท, เบอร์โทร, อีเมล, LINE ID, Instagram และข้อความที่คุณส่งมา</p>
+<p>เราอาจเก็บ IP address และ user-agent จากคำขอ เพื่อป้องกันสแปมและรักษาความปลอดภัย</p>
+
+<h2>2. วิธีใช้ข้อมูล</h2>
+<ul>
+<li>ติดต่อกลับตามช่องทางที่คุณระบุ</li>
+<li>จัดการ waitlist และ demo request</li>
+<li>ส่งแจ้งเตือนภายในทีมผ่าน LINE/Telegram</li>
+<li>ปรับปรุงบริการและป้องกันการใช้งานผิดประเภท</li>
+</ul>
+
+<h2>3. การแชร์ข้อมูล</h2>
+<p>เราไม่ขายหรือแชร์ข้อมูลส่วนบุคคลให้บุคคลที่สาม ข้อมูลถูกใช้ภายในทีม Blutenstein เท่านั้น</p>
+
+<h2>4. การเก็บรักษา</h2>
+<p>ข้อมูลถูกเก็บในเซิร์ฟเวอร์ของเราและจะถูกลบเมื่อคุณร้องขอ เราเก็บข้อมูลไว้ตราบเท่าที่จำเป็นสำหรับการให้บริการ</p>
+
+<h2>5. สิทธิ์ของคุณ</h2>
+<p>คุณมีสิทธิ์เข้าถึง แก้ไข หรือขอลบข้อมูลส่วนบุคคลได้ โดยติดต่อเราผ่านช่องทางที่ระบุบนเว็บไซต์</p>
+
+<h2>6. ความปลอดภัย</h2>
+<p>เราใช้ HTTPS, environment variables สำหรับ secret ทั้งหมด และไม่เก็บ token/password ใน code repository</p>
+
+<h2>7. ติดต่อเรา</h2>
+<p>อีเมล: <a href="mailto:hello@blutenstein.com">hello@blutenstein.com</a> · LINE: <a href="https://line.me/R/ti/p/@903gggqk">@blutenstein</a></p>
+</body></html>"""
+
+
+TERMS_HTML = """<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Terms of Service — Blutenstein</title>
+<style>body{max-width:780px;margin:40px auto;padding:0 24px;font-family:'Source Sans 3',system-ui,sans-serif;color:#061b31;line-height:1.7}h1{font-size:32px;letter-spacing:-.03em}h2{font-size:22px;margin-top:32px}a{color:#533afd}</style></head>
+<body>
+<h1>ข้อกำหนดการใช้งาน</h1>
+<p><em>อัปเดตล่าสุด: 1 พฤษภาคม 2026</em></p>
+
+<h2>1. การยอมรับ</h2>
+<p>การใช้งานเว็บไซต์และบริการของ Blutenstein ถือว่าคุณยอมรับข้อกำหนดเหล่านี้</p>
+
+<h2>2. บริการ</h2>
+<p>Blutenstein ให้บริการ automation สำหรับโรงงานและ SME ไทย รวมถึงการรวมออเดอร์จาก marketplace, การจัดการสต๊อก และการแจ้งเตือนผ่าน LINE/Telegram</p>
+
+<h2>3. การใช้งานที่เหมาะสม</h2>
+<p>คุณต้องไม่ใช้บริการเพื่อวัตถุประสงค์ที่ผิดกฎหมาย หรือพยายามเข้าถึงระบบโดยไม่ได้รับอนุญาต</p>
+
+<h2>4. การปฏิเสธความรับผิด</h2>
+<p>บริการนี้ให้ "ตามสภาพ" เราไม่รับประกันว่าบริการจะไม่หยุดชะงักหรือปราศจากข้อผิดพลาด</p>
+
+<h2>5. การเปลี่ยนแปลง</h2>
+<p>เราอาจแก้ไขข้อกำหนดเป็นครั้งคราว การใช้งานต่อหลังจากมีการเปลี่ยนแปลงถือว่าคุณยอมรับข้อกำหนดใหม่</p>
+</body></html>"""
+
+
 HTML = """<!doctype html>
 <html lang="th">
 <head>
@@ -704,7 +801,18 @@ HTML = """<!doctype html>
   <meta name="description" content="Blutenstein คือ AI Factory Automation OS สำหรับโรงงานและ SME ไทย รวมออเดอร์ marketplace ตัดสต๊อก ทำ ledger แจ้งเตือน LINE/Telegram และเตรียม production visibility" />
   <meta property="og:title" content="Blutenstein — AI Factory Automation OS" />
   <meta property="og:description" content="จาก Marketplace Order สู่ Stock Ledger, Production Pulse และ Owner Brief ในระบบเดียว" />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://www.blutenstein.com/" />
+  <meta property="og:image" content="https://www.blutenstein.com/static/og-image.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Blutenstein — AI Factory Automation OS" />
+  <meta name="twitter:description" content="จาก Marketplace Order สู่ Stock Ledger, Production Pulse และ Owner Brief ในระบบเดียว" />
+  <meta name="twitter:image" content="https://www.blutenstein.com/static/og-image.png" />
   <meta name="theme-color" content="#061b31" />
+  <meta name="robots" content="index, follow" />
+  <link rel="canonical" href="https://www.blutenstein.com/" />
+  <link rel="icon" href="/static/favicon.ico" sizes="any" />
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@300;400;500;600;700&family=Source+Code+Pro:wght@400;500;700&display=swap" rel="stylesheet">
@@ -727,12 +835,17 @@ HTML = """<!doctype html>
     .section{padding:96px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:32px;margin-bottom:30px}.section h2{font-size:clamp(34px,5vw,64px);line-height:1.08;letter-spacing:-.048em;font-weight:300;margin:0;max-width:760px}.section .sub{font-size:18px;color:var(--muted);font-weight:300;margin:0;max-width:520px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.card{background:rgba(255,255,255,.82);border:1px solid var(--border);border-radius:8px;padding:26px;box-shadow:var(--soft-shadow)}.card h3{font-size:25px;line-height:1.05;letter-spacing:-.04em;font-weight:300;margin:0 0 10px}.card p{color:var(--muted);font-weight:300;margin:0}.num{font-family:'Source Code Pro',monospace;color:var(--purple);font-size:12px;background:#f1f0ff;border:1px solid #d6d9fc;padding:5px 7px;border-radius:4px;display:inline-flex;margin-bottom:46px}.dark-band{background:radial-gradient(circle at 15% 0%,rgba(249,107,238,.22),transparent 35%),linear-gradient(180deg,#10113d,#070b20);color:#fff;margin:24px;border-radius:24px;overflow:hidden}.dark-band .sub,.dark-band .card p{color:rgba(255,255,255,.68)}.dark-band .card{background:rgba(255,255,255,.07);border-color:rgba(255,255,255,.11);box-shadow:none}.templates{display:grid;grid-template-columns:1.15fr .85fr;gap:16px}.workflow{display:grid;gap:10px}.node{display:flex;justify-content:space-between;align-items:center;padding:14px;border-radius:8px;background:rgba(255,255,255,.09);border:1px solid rgba(255,255,255,.11)}.node span{font-family:'Source Code Pro',monospace;font-size:12px;color:#c8d2ff}.terminal{background:#050813;border-radius:8px;border:1px solid rgba(255,255,255,.1);padding:18px;font-family:'Source Code Pro',monospace;font-size:12px;line-height:1.8;color:#c8d2ff;min-height:268px}.terminal b{color:#b7ffd0;font-weight:500}.terminal em{color:#ffd7ef;font-style:normal}.timeline{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.phase{position:relative;overflow:hidden}.phase:after{content:"";position:absolute;right:-35px;top:-35px;width:90px;height:90px;border-radius:50%;background:rgba(83,58,253,.08)}.phase b{color:var(--purple);font-family:'Source Code Pro',monospace;font-size:12px}.pricing{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.price{min-height:340px}.price.featured{background:linear-gradient(180deg,#11183f,#0a1029);color:#fff;transform:translateY(-10px);border-color:#11183f}.price.featured p,.price.featured li{color:rgba(255,255,255,.68)}.amount{font-size:44px;font-weight:300;letter-spacing:-.06em;margin:18px 0}.price ul{padding:0;margin:22px 0 0;list-style:none;display:grid;gap:10px}.price li{color:var(--muted);font-weight:300}.price li:before{content:"✓";color:var(--green);font-weight:700;margin-right:8px}.form-wrap{display:grid;grid-template-columns:.88fr 1.12fr;gap:18px}.form{display:grid;gap:12px}input,textarea{width:100%;border:1px solid var(--border);border-radius:8px;background:#fff;padding:15px 16px;font:inherit;color:var(--ink);outline:none;box-shadow:rgba(23,23,23,.03) 0 3px 8px}textarea{min-height:130px;resize:vertical}input:focus,textarea:focus{border-color:var(--purple);box-shadow:0 0 0 3px rgba(83,58,253,.12)}.result{min-height:22px;color:#108c3d;font-weight:600}.footer{padding:42px 0;color:var(--muted);border-top:1px solid var(--border);background:#fff}.footerin{display:flex;justify-content:space-between;gap:20px}.footer b{color:var(--ink)}
     @media(max-width:940px){.links{display:none}.mobile{display:inline-flex}.hero{grid-template-columns:1fr;padding:54px 0}.cockpit{transform:none}.section-head{display:block}.section .sub{margin-top:15px}.grid,.pricing,.timeline,.templates,.form-wrap{grid-template-columns:1fr}.price.featured{transform:none}.dark-band{margin:12px}.footerin{display:block}.screen{min-height:auto}}
     @media(max-width:560px){.wrap{padding:0 18px}.hero h1{font-size:48px}.hero-actions .btn{width:100%}.kpis{grid-template-columns:1fr}.section{padding:70px 0}.card{padding:22px}.cockpit{margin:0 -8px}.dark-band{border-radius:16px}}
+    .skip-link{position:absolute;left:-999px;top:0;z-index:999;background:var(--purple);color:#fff;padding:12px 20px;border-radius:0 0 8px 0;font-weight:600}.skip-link:focus{left:0}
+    .honeypot{position:absolute;left:-9999px;opacity:0;height:0;overflow:hidden}
+    .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+    .btn[disabled],.btn.primary[disabled]{opacity:.6;cursor:not-allowed;transform:none}
   </style>
 </head>
 <body>
-  <nav class="nav"><div class="wrap navin"><a class="brand" href="#top"><span class="mark"></span><span>Blutenstein</span></a><div class="links"><a href="#platform">Platform</a><a href="#templates">Templates</a><a href="#roadmap">Roadmap</a><a href="#pricing">Pricing</a><a href="#connect" >Connect</a><a href="#demo" class="btn primary">ขอ Demo</a></div><a class="mobile btn primary" href="#demo">Demo</a></div></nav>
+  <a class="skip-link" href="#main-content">ข้ามไปเนื้อหาหลัก</a>
+  <header class="nav" role="banner"><div class="wrap navin"><a class="brand" href="#top" aria-label="Blutenstein หน้าแรก"><span class="mark" aria-hidden="true"></span><span>Blutenstein</span></a><nav class="links" aria-label="เมนูหลัก"><a href="#platform">Platform</a><a href="#templates">Templates</a><a href="#roadmap">Roadmap</a><a href="#pricing">Pricing</a><a href="#connect">Connect</a><a href="#demo" class="btn primary">ขอ Demo</a></nav><a class="mobile btn primary" href="#demo" aria-label="ขอ Demo">Demo</a></div></header>
   <main id="top" class="wrap">
-    <section class="hero">
+    <section class="hero" id="main-content">
       <div class="orb one"></div><div class="orb two"></div>
       <div>
         <div class="eyebrow"><span class="pulse"></span> Live: LINE + Telegram notifications are online</div>
@@ -755,16 +868,35 @@ HTML = """<!doctype html>
       </div>
     </section>
   </main>
-  <section id="platform" class="section"><div class="wrap"><div class="section-head"><h2>Automation ที่เริ่มจาก pain จริง ไม่ใช่ dashboard สวยเฉย ๆ</h2><p class="sub">เราไม่ขาย ERP ก้อนใหญ่ เราขายระบบที่ทำให้เจ้าของรู้ทันทีว่า order เข้าไหม, stock ลดถูกไหม, อะไรต้องแก้ก่อนเสียเงิน</p></div><div class="grid"><div class="card"><span class="num">01 / ingest</span><h3>รวมออเดอร์หลายช่องทาง</h3><p>รับ webhook จาก marketplace แล้ว normalize ให้ทีมเห็น order format เดียว ไม่ต้อง copy/paste ระหว่างหลังบ้าน</p></div><div class="card"><span class="num">02 / ledger</span><h3>ตัดสต๊อกพร้อมหลักฐาน</h3><p>ทุก SKU movement ผูกกับ order_id, platform และเหตุผล ลดปัญหา stock ไม่ตรงแบบหาสาเหตุไม่ได้</p></div><div class="card"><span class="num">03 / alert</span><h3>แจ้งเตือนแบบมนุษย์อ่านรู้เรื่อง</h3><p>LINE/Telegram แจ้งเฉพาะเรื่องที่ต้องตัดสินใจ เช่น low stock, token fail, SKU mapping missing</p></div></div></div></section>
+  <section id="platform" class="section" aria-label="Platform features"><div class="wrap"><div class="section-head"><h2>Automation ที่เริ่มจาก pain จริง ไม่ใช่ dashboard สวยเฉย ๆ</h2><p class="sub">เราไม่ขาย ERP ก้อนใหญ่ เราขายระบบที่ทำให้เจ้าของรู้ทันทีว่า order เข้าไหม, stock ลดถูกไหม, อะไรต้องแก้ก่อนเสียเงิน</p></div><div class="grid"><div class="card"><span class="num">01 / ingest</span><h3>รวมออเดอร์หลายช่องทาง</h3><p>รับ webhook จาก marketplace แล้ว normalize ให้ทีมเห็น order format เดียว ไม่ต้อง copy/paste ระหว่างหลังบ้าน</p></div><div class="card"><span class="num">02 / ledger</span><h3>ตัดสต๊อกพร้อมหลักฐาน</h3><p>ทุก SKU movement ผูกกับ order_id, platform และเหตุผล ลดปัญหา stock ไม่ตรงแบบหาสาเหตุไม่ได้</p></div><div class="card"><span class="num">03 / alert</span><h3>แจ้งเตือนแบบมนุษย์อ่านรู้เรื่อง</h3><p>LINE/Telegram แจ้งเฉพาะเรื่องที่ต้องตัดสินใจ เช่น low stock, token fail, SKU mapping missing</p></div></div></div></section>
   <section class="dark-band"><div class="wrap section" id="templates"><div class="section-head"><h2>Template engine สำหรับโรงงานไทยที่อยากเริ่มเร็ว</h2><p class="sub">เริ่มจาก workflow ที่ผ่าน end-to-end test แล้ว แล้ว clone เป็นระบบของลูกค้าแต่ละโรงงานได้โดยไม่สร้างใหม่จากศูนย์</p></div><div class="templates"><div class="workflow"><div class="node"><b>Marketplace Backbone</b><span>webhook → verify → normalize</span></div><div class="node"><b>Inventory Ledger</b><span>save order → deduct stock</span></div><div class="node"><b>Low Stock Ritual</b><span>velocity → reorder alert</span></div><div class="node"><b>Owner Morning Brief</b><span>sales → risk → action list</span></div></div><div class="terminal"><b>blutenstein.sync()</b><br>order.platform = <em>"shopee"</em><br>sku.delta = -4<br>ledger.reason = <em>"order_deduction"</em><br>alert.telegram = true<br>alert.line = true<br><br><b>Result:</b> one calm operating layer for owner + team</div></div></div></section>
   <section id="roadmap" class="section"><div class="wrap"><div class="section-head"><h2>Roadmap แบบ startup ที่ไม่เผาเงิน</h2><p class="sub">เริ่มจาก single-server MVP ที่ใช้งานได้จริง แล้วค่อยยกระดับเป็น multi-tenant SaaS เมื่อมี pilot และ revenue</p></div><div class="timeline"><div class="card phase"><b>MONTH 1-2</b><h3>MVP</h3><p>Portal, order intake, inventory ledger, LINE/Telegram alerts, first pilot</p></div><div class="card phase"><b>MONTH 3-4</b><h3>Paid beta</h3><p>Onboarding wizard, tenant templates, AI daily summary, error inbox</p></div><div class="card phase"><b>MONTH 5-6</b><h3>Reliability</h3><p>Postgres, queue, backups, monitoring, restore drills, audit exports</p></div><div class="card phase"><b>MONTH 7-12</b><h3>Scale</h3><p>Template marketplace, agency onboarding, enterprise isolation, Thai/EN switch</p></div></div></div></section>
   <section id="pricing" class="section"><div class="wrap"><div class="section-head"><h2>ราคาให้ SME ไทยกล้าลอง แต่โตไปกับระบบได้</h2><p class="sub">แพ็กเกจเริ่มจาก order + stock automation ก่อน แล้วค่อยขยายไป production ops, BOM, approval และ analytics</p></div><div class="pricing"><div class="card price"><h3>Starter</h3><p>เริ่มจัดระเบียบ order + stock</p><div class="amount">฿990–1,990</div><ul><li>1-2 sales channels</li><li>Inventory + stock ledger</li><li>Basic daily report</li><li>LINE/Telegram alert basic</li></ul></div><div class="card price featured"><h3>Growth</h3><p>สำหรับ seller/factory หลายช่องทาง</p><div class="amount">฿3,900–7,900</div><ul><li>Shopee, Lazada, TikTok, Facebook</li><li>Workflow templates</li><li>Low-stock + exception alerts</li><li>Setup support included</li></ul></div><div class="card price"><h3>Factory Ops</h3><p>สำหรับโรงงานที่ต้อง custom</p><div class="amount">฿12,000+</div><ul><li>Production task board</li><li>BOM/material checks</li><li>Approval workflows</li><li>Custom dashboard + priority support</li></ul></div></div></div></section>
   <section id="connect" class="section"><div class="wrap"><div class="section-head"><h2>Customer Connect Center</h2><p class="sub">ช่องทางติดต่อจริงสำหรับเริ่มคุยกับ Blutenstein — ลูกค้ากดเพิ่ม LINE OA หรือเริ่ม Telegram bot ก่อน ระบบจึงผูกตัวตนเพื่อ automation ต่อได้</p></div><div class="grid"><a class="card" href="__LINE_CONNECT_URL__" target="_blank" rel="noopener"><span class="num">LINE</span><h3>Add LINE OA</h3><p>เพิ่ม OA เพื่อเริ่มคุยและให้ระบบจับ source ID สำหรับงานตอบกลับอัตโนมัติในอนาคต</p></a><a class="card" href="__TELEGRAM_CONNECT_URL__" target="_blank" rel="noopener"><span class="num">Telegram</span><h3>Start Telegram Bot</h3><p>เริ่ม bot เพื่อเปิด chat_id สำหรับ automation</p></a><a class="card" href="__EMAIL_CONNECT_URL__"><span class="num">Email</span><h3>Email confirmation</h3><p>ส่งอีเมลยืนยัน/ขอ demo ผ่านช่องทางพื้นฐาน</p></a><a class="card" href="__INSTAGRAM_CONNECT_URL__" target="_blank" rel="noopener"><span class="num">Instagram</span><h3>Instagram DM</h3><p>เปิด DM สำหรับคุยรายละเอียดและนัด onboarding</p></a></div></div></section>
-  <section id="demo" class="section"><div class="wrap form-wrap"><div class="card"><span class="eyebrow"><span class="pulse"></span> Pilot slots open</span><h2 style="font-size:clamp(40px,5vw,64px);line-height:.96;letter-spacing:-.065em;font-weight:300;margin:24px 0 18px">ให้ Blutenstein วาด workflow จริงของโรงงานคุณ</h2><p class="sub">ส่งข้อมูลมา ระบบจะบันทึกเป็น waitlist และแจ้งทีมผ่าน Telegram + LINE ทันที โดย token ทั้งหมดอ่านจาก environment variables เท่านั้น ไม่มี secret อยู่ใน code</p></div><div class="card"><form id="lead" class="form"><input name="name" placeholder="ชื่อ" required><input name="company" placeholder="บริษัท / ร้าน / โรงงาน"><input name="phone" placeholder="เบอร์โทร"><input name="email" placeholder="อีเมล"><input name="line_id" placeholder="LINE ID (ถ้ามี)"><input name="instagram" placeholder="Instagram (ถ้ามี)"><input name="preferred_contact" placeholder="อยากให้ติดต่อกลับทางไหน เช่น email / LINE / โทร"><input name="channels" placeholder="ขายผ่านช่องทางไหน เช่น Shopee, Lazada, TikTok"><textarea name="message" placeholder="ปัญหาหลังบ้านที่อยากแก้ เช่น สต๊อกไม่ตรง, oversell, report ช้า"></textarea><button class="btn primary" type="submit">ส่งคำขอ Demo</button><div id="result" class="result"></div></form></div></div></section>
-  <footer class="footer"><div class="wrap footerin"><div><b>Blutenstein</b><br>AI-powered factory automation OS for Thai SME factories.</div><div class="mono">https://www.blutenstein.com · portal v0.3.0</div></div></footer>
+  <section id="demo" class="section" aria-label="ขอ Demo"><div class="wrap form-wrap"><div class="card"><span class="eyebrow"><span class="pulse" aria-hidden="true"></span> Pilot slots open</span><h2 style="font-size:clamp(40px,5vw,64px);line-height:.96;letter-spacing:-.065em;font-weight:300;margin:24px 0 18px">ให้ Blutenstein วาด workflow จริงของโรงงานคุณ</h2><p class="sub">ส่งข้อมูลมา ระบบจะบันทึกเป็น waitlist และแจ้งทีมผ่าน Telegram + LINE ทันที โดย token ทั้งหมดอ่านจาก environment variables เท่านั้น ไม่มี secret อยู่ใน code</p></div><div class="card"><form id="lead" class="form" novalidate><div class="honeypot" aria-hidden="true"><label for="hp_website">Leave blank</label><input type="text" id="hp_website" name="website" tabindex="-1" autocomplete="off"></div><label class="sr-only" for="lead-name">ชื่อ</label><input id="lead-name" name="name" placeholder="ชื่อ" required aria-required="true"><label class="sr-only" for="lead-company">บริษัท</label><input id="lead-company" name="company" placeholder="บริษัท / ร้าน / โรงงาน"><label class="sr-only" for="lead-phone">เบอร์โทร</label><input id="lead-phone" name="phone" type="tel" placeholder="เบอร์โทร" inputmode="tel"><label class="sr-only" for="lead-email">อีเมล</label><input id="lead-email" name="email" type="email" placeholder="อีเมล" inputmode="email"><label class="sr-only" for="lead-line">LINE ID</label><input id="lead-line" name="line_id" placeholder="LINE ID (ถ้ามี)"><label class="sr-only" for="lead-ig">Instagram</label><input id="lead-ig" name="instagram" placeholder="Instagram (ถ้ามี)"><label class="sr-only" for="lead-pref">ช่องทางติดต่อกลับ</label><input id="lead-pref" name="preferred_contact" placeholder="อยากให้ติดต่อกลับทางไหน เช่น email / LINE / โทร"><label class="sr-only" for="lead-channels">ช่องทางขาย</label><input id="lead-channels" name="channels" placeholder="ขายผ่านช่องทางไหน เช่น Shopee, Lazada, TikTok"><label class="sr-only" for="lead-message">รายละเอียด</label><textarea id="lead-message" name="message" placeholder="ปัญหาหลังบ้านที่อยากแก้ เช่น สต๊อกไม่ตรง, oversell, report ช้า"></textarea><button class="btn primary" type="submit">ส่งคำขอ Demo</button><div id="result" class="result" role="status" aria-live="polite"></div></form></div></div></section>
+  <footer class="footer" role="contentinfo"><div class="wrap footerin"><div><b>Blutenstein</b><br>AI-powered factory automation OS for Thai SME factories.<br><small><a href="/privacy" style="color:var(--purple)">Privacy Policy</a> · <a href="/terms" style="color:var(--purple)">Terms</a></small></div><div class="mono">https://www.blutenstein.com · portal v0.5.0</div></div></footer>
 <script>
-const form=document.getElementById('lead'), result=document.getElementById('result');
-form.addEventListener('submit', async e=>{e.preventDefault(); result.textContent='กำลังส่ง...'; const data=Object.fromEntries(new FormData(form).entries()); try{const r=await fetch('/api/waitlist',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)}); const j=await r.json(); result.textContent = j.status==='ok' ? (j.user_feedback || 'ส่งเรียบร้อย ทีมงานจะติดต่อกลับเร็ว ๆ นี้') : 'ส่งไม่สำเร็จ กรุณาลองใหม่'; if(j.status==='ok') form.reset();}catch(err){result.textContent='เชื่อมต่อไม่ได้ กรุณาลองใหม่อีกครั้ง';}});
+(function(){
+  var form=document.getElementById('lead'), result=document.getElementById('result'), btn=form.querySelector('button[type="submit"]');
+  form.addEventListener('submit', async function(e){
+    e.preventDefault();
+    var hp=form.querySelector('[name="website"]');
+    if(hp && hp.value){result.textContent='ขอบคุณครับ'; return;}
+    btn.disabled=true; btn.textContent='กำลังส่ง...'; result.textContent='';
+    var data=Object.fromEntries(new FormData(form).entries());
+    delete data.website;
+    try{
+      var r=await fetch('/api/waitlist',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)});
+      var j=await r.json();
+      result.textContent = j.status==='ok' ? (j.user_feedback || 'ส่งเรียบร้อย ทีมงานจะติดต่อกลับเร็ว ๆ นี้') : 'ส่งไม่สำเร็จ กรุณาลองใหม่';
+      if(j.status==='ok') form.reset();
+    }catch(err){
+      result.textContent='เชื่อมต่อไม่ได้ กรุณาลองใหม่อีกครั้ง';
+    }finally{
+      btn.disabled=false; btn.textContent='ส่งคำขอ Demo';
+    }
+  });
+})();
 </script>
 </body>
 </html>"""
