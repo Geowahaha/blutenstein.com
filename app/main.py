@@ -3,7 +3,12 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import smtplib
+import sqlite3
+import uuid
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Optional
 
@@ -20,8 +25,9 @@ load_dotenv()
 
 APP_ENV = os.getenv("APP_ENV", "production")
 WAITLIST_STORE = Path(os.getenv("WAITLIST_STORE", "/data/waitlist.jsonl"))
+CUSTOMER_DB = Path(os.getenv("CUSTOMER_DB", "/data/customer_memory.sqlite3"))
 
-app = FastAPI(title="Blutenstein Portal", version="0.4.0")
+app = FastAPI(title="Blutenstein Portal", version="0.5.0")
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 
@@ -32,10 +38,223 @@ class WaitlistLead(BaseModel):
     company: Optional[str] = Field(default=None, max_length=160)
     channels: Optional[str] = Field(default=None, max_length=240)
     message: Optional[str] = Field(default=None, max_length=1200)
+    line_id: Optional[str] = Field(default=None, max_length=120)
+    instagram: Optional[str] = Field(default=None, max_length=120)
+    preferred_contact: Optional[str] = Field(default=None, max_length=80)
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_email(value: str | None) -> str | None:
+    if not value:
+        return None
+    value = value.strip().lower()
+    return value or None
+
+
+def normalize_phone(value: str | None) -> str | None:
+    if not value:
+        return None
+    raw = re.sub(r"[^0-9+]", "", value.strip())
+    if raw.startswith("+66"):
+        return "0" + raw[3:]
+    if raw.startswith("66") and len(raw) >= 11:
+        return "0" + raw[2:]
+    return raw or None
+
+
+def normalize_handle(value: str | None) -> str | None:
+    if not value:
+        return None
+    return value.strip().lstrip("@").lower() or None
+
+
+def db() -> sqlite3.Connection:
+    CUSTOMER_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(CUSTOMER_DB)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_customer_db() -> None:
+    with db() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS customers (
+          id TEXT PRIMARY KEY,
+          name TEXT,
+          company TEXT,
+          email TEXT,
+          phone TEXT,
+          line_id TEXT,
+          instagram TEXT,
+          preferred_contact TEXT,
+          first_seen_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          tags TEXT DEFAULT '[]',
+          notes TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS contact_methods (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          customer_id TEXT NOT NULL,
+          type TEXT NOT NULL,
+          value TEXT NOT NULL,
+          verified INTEGER DEFAULT 0,
+          can_push INTEGER DEFAULT 0,
+          source TEXT,
+          created_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          UNIQUE(type, value),
+          FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS interactions (
+          id TEXT PRIMARY KEY,
+          customer_id TEXT,
+          source TEXT NOT NULL,
+          direction TEXT NOT NULL,
+          subject TEXT,
+          body TEXT,
+          payload_json TEXT,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE SET NULL
+        );
+        CREATE TABLE IF NOT EXISTS outbound_messages (
+          id TEXT PRIMARY KEY,
+          customer_id TEXT,
+          channel TEXT NOT NULL,
+          destination TEXT,
+          status TEXT NOT NULL,
+          error TEXT,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE SET NULL
+        );
+        """)
+
+
+@app.on_event("startup")
+def startup() -> None:
+    init_customer_db()
+
+
+def find_customer(conn: sqlite3.Connection, contacts: dict[str, str | None]) -> str | None:
+    for ctype, value in contacts.items():
+        if not value:
+            continue
+        row = conn.execute("SELECT customer_id FROM contact_methods WHERE type=? AND value=?", (ctype, value)).fetchone()
+        if row:
+            return row["customer_id"]
+    # Fallback for old rows if contact_methods was not populated yet.
+    for field in ["email", "phone", "line_id", "instagram"]:
+        value = contacts.get(field)
+        if value:
+            row = conn.execute(f"SELECT id FROM customers WHERE {field}=?", (value,)).fetchone()
+            if row:
+                return row["id"]
+    return None
+
+
+def remember_customer(*, source: str, name: str | None = None, company: str | None = None,
+                      email: str | None = None, phone: str | None = None, line_id: str | None = None,
+                      instagram: str | None = None, preferred_contact: str | None = None,
+                      subject: str | None = None, body: str | None = None, payload: dict | None = None) -> dict:
+    init_customer_db()
+    email_n = normalize_email(email)
+    phone_n = normalize_phone(phone)
+    line_n = normalize_handle(line_id)
+    ig_n = normalize_handle(instagram)
+    now = now_iso()
+    contacts = {"email": email_n, "phone": phone_n, "line_id": line_n, "instagram": ig_n}
+    with db() as conn:
+        customer_id = find_customer(conn, contacts) or f"cust_{uuid.uuid4().hex[:12]}"
+        existing = conn.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
+        if existing:
+            conn.execute(
+                """UPDATE customers SET
+                   name=COALESCE(NULLIF(?,''), name), company=COALESCE(NULLIF(?,''), company),
+                   email=COALESCE(?, email), phone=COALESCE(?, phone), line_id=COALESCE(?, line_id),
+                   instagram=COALESCE(?, instagram), preferred_contact=COALESCE(NULLIF(?,''), preferred_contact),
+                   last_seen_at=? WHERE id=?""",
+                (name or "", company or "", email_n, phone_n, line_n, ig_n, preferred_contact or "", now, customer_id),
+            )
+            returning = True
+        else:
+            conn.execute(
+                """INSERT INTO customers(id,name,company,email,phone,line_id,instagram,preferred_contact,first_seen_at,last_seen_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (customer_id, name, company, email_n, phone_n, line_n, ig_n, preferred_contact, now, now),
+            )
+            returning = False
+        for ctype, value in contacts.items():
+            if value:
+                conn.execute(
+                    """INSERT INTO contact_methods(customer_id,type,value,source,created_at,last_seen_at)
+                       VALUES(?,?,?,?,?,?)
+                       ON CONFLICT(type,value) DO UPDATE SET customer_id=excluded.customer_id,last_seen_at=excluded.last_seen_at,source=excluded.source""",
+                    (customer_id, ctype, value, source, now, now),
+                )
+        interaction_id = f"int_{uuid.uuid4().hex[:12]}"
+        conn.execute(
+            """INSERT INTO interactions(id,customer_id,source,direction,subject,body,payload_json,created_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (interaction_id, customer_id, source, "inbound", subject, body, json.dumps(payload or {}, ensure_ascii=False), now),
+        )
+        return {"customer_id": customer_id, "interaction_id": interaction_id, "returning_customer": returning}
+
+
+def smtp_configured() -> bool:
+    return bool(os.getenv("SMTP_HOST") and (os.getenv("SMTP_FROM") or os.getenv("EMAIL_FROM")))
+
+
+async def send_email_feedback(to_email: str | None, subject: str, body: str, customer_id: str | None = None) -> bool:
+    to_email = normalize_email(to_email)
+    if not to_email or not smtp_configured():
+        return False
+    status, error = "sent", None
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = os.getenv("SMTP_FROM") or os.getenv("EMAIL_FROM")
+        msg["To"] = to_email
+        msg.set_content(body)
+        host = os.environ["SMTP_HOST"]
+        port = int(os.getenv("SMTP_PORT", "587"))
+        username = os.getenv("SMTP_USERNAME") or os.getenv("SMTP_USER")
+        password = os.getenv("SMTP_PASSWORD") or os.getenv("SMTP_PASS")
+        use_ssl = os.getenv("SMTP_SSL", "false").lower() in {"1", "true", "yes"}
+        if use_ssl:
+            server = smtplib.SMTP_SSL(host, port, timeout=12)
+        else:
+            server = smtplib.SMTP(host, port, timeout=12)
+            if os.getenv("SMTP_STARTTLS", "true").lower() not in {"0", "false", "no"}:
+                server.starttls()
+        with server:
+            if username and password:
+                server.login(username, password)
+            server.send_message(msg)
+        return True
+    except Exception as exc:
+        status, error = "failed", str(exc)[:300]
+        return False
+    finally:
+        if customer_id:
+            try:
+                with db() as conn:
+                    conn.execute(
+                        "INSERT INTO outbound_messages(id,customer_id,channel,destination,status,error,created_at) VALUES(?,?,?,?,?,?,?)",
+                        (f"out_{uuid.uuid4().hex[:12]}", customer_id, "email", to_email, status, error, now_iso()),
+                    )
+            except Exception:
+                pass
+
+
+def user_receipt_text(kind: str, customer_id: str, returning: bool) -> str:
+    prefix = "ยินดีต้อนรับกลับ" if returning else "รับเรื่องแล้ว"
+    if kind == "successcasting_order":
+        return f"{prefix} — ระบบบันทึกคำสั่งซื้อและจำข้อมูลลูกค้าไว้แล้ว เลขอ้างอิง {customer_id} ทีมจะตอบกลับตามช่องทางที่ให้ไว้"
+    return f"{prefix} — Blutenstein บันทึกข้อมูลและประวัติการคุยไว้แล้ว เลขอ้างอิง {customer_id} ครั้งต่อไประบบจะรู้จักคุณจากเบอร์/อีเมล/LINE ID เดิม"
 
 
 async def send_telegram(text: str) -> bool:
@@ -92,7 +311,7 @@ def healthz():
         "status": "ok",
         "app": "blutenstein-portal",
         "env": APP_ENV,
-        "version": "0.4.0",
+        "version": "0.5.0",
         "notifications": {
             "telegram_token": bool(os.getenv("BlutensteinTelegrambot_API") or os.getenv("TELEGRAM_BOT_TOKEN")),
             "telegram_chat": bool(os.getenv("BlutensteinTelegram_ID") or os.getenv("TELEGRAM_CHAT_ID")),
@@ -100,6 +319,8 @@ def healthz():
             "line_target": bool(line_target()),
             "line_transport": "messaging_api_push",
             "facebook_token": bool(os.getenv("Blutenstein_FB_TOKEN") or os.getenv("FACEBOOK_ACCESS_TOKEN")),
+            "email_smtp": smtp_configured(),
+            "customer_memory_db": CUSTOMER_DB.exists(),
         },
     }
 
@@ -122,6 +343,24 @@ def integrations_status():
             "line_target": "configured" if line_target() else "needs-userId-or-groupId-from-webhook",
         },
     }
+
+
+@app.get("/api/customer-memory/status")
+def customer_memory_status():
+    init_customer_db()
+    with db() as conn:
+        return {
+            "status": "ready",
+            "db": str(CUSTOMER_DB),
+            "counts": {
+                "customers": conn.execute("SELECT COUNT(*) AS n FROM customers").fetchone()["n"],
+                "contact_methods": conn.execute("SELECT COUNT(*) AS n FROM contact_methods").fetchone()["n"],
+                "interactions": conn.execute("SELECT COUNT(*) AS n FROM interactions").fetchone()["n"],
+                "outbound_messages": conn.execute("SELECT COUNT(*) AS n FROM outbound_messages").fetchone()["n"],
+            },
+            "matching_keys": ["email", "phone", "line_id", "instagram"],
+            "privacy_note": "public endpoint returns counts only; no customer PII",
+        }
 
 
 @app.post("/api/line/webhook")
@@ -148,13 +387,23 @@ async def line_webhook(request: Request):
         if target:
             sources.append({"type": source.get("type"), "target": target, "event": event.get("type")})
 
+    remembered = []
     if sources:
         WAITLIST_STORE.parent.mkdir(parents=True, exist_ok=True)
         with (WAITLIST_STORE.parent / "line_sources.jsonl").open("a", encoding="utf-8") as f:
             for source in sources:
                 f.write(json.dumps({"created_at": datetime.now(timezone.utc).isoformat(), **source}, ensure_ascii=False) + "\n")
+                memory = remember_customer(
+                    source="line_webhook",
+                    line_id=source.get("target"),
+                    preferred_contact="line",
+                    subject=f"LINE {source.get('event')} event",
+                    body="LINE webhook source captured",
+                    payload={"source_type": source.get("type"), "event": source.get("event")},
+                )
+                remembered.append(memory["customer_id"])
 
-    return {"status": "ok", "sources_found": len(sources), "next_env": "set LINE_MESSAGING_TO to the captured target"}
+    return {"status": "ok", "sources_found": len(sources), "customers_remembered": len(set(remembered)), "next_env": "set LINE_MESSAGING_TO to the captured target for owner/admin push"}
 
 
 @app.post("/api/waitlist")
@@ -169,17 +418,55 @@ async def waitlist(lead: WaitlistLead, request: Request):
     with WAITLIST_STORE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    memory = remember_customer(
+        source="blutenstein_demo_form",
+        name=lead.name,
+        company=lead.company,
+        email=lead.email,
+        phone=lead.phone,
+        line_id=lead.line_id,
+        instagram=lead.instagram,
+        preferred_contact=lead.preferred_contact,
+        subject="Blutenstein demo request",
+        body=lead.message,
+        payload=record,
+    )
+
     text = "🏭 New Blutenstein demo request\n" + "\n".join([
+        f"Customer ID: {memory['customer_id']}",
+        f"Returning: {memory['returning_customer']}",
         f"Name: {lead.name}",
         f"Company: {lead.company or '-'}",
         f"Phone: {lead.phone or '-'}",
         f"Email: {lead.email or '-'}",
+        f"LINE ID: {lead.line_id or '-'}",
+        f"Instagram: {lead.instagram or '-'}",
+        f"Preferred: {lead.preferred_contact or '-'}",
         f"Channels: {lead.channels or '-'}",
         f"Message: {lead.message or '-'}",
     ])
     telegram_ok = await send_telegram(text)
     line_ok = await send_line(text)
-    return {"status": "ok", "message": "received", "notifications": {"telegram": telegram_ok, "line": line_ok}}
+    email_ok = await send_email_feedback(
+        lead.email,
+        "Blutenstein ได้รับคำขอ Demo แล้ว",
+        "สวัสดีครับ/ค่ะ {name}\n\nBlutenstein ได้รับคำขอ Demo ของคุณแล้ว\nเลขอ้างอิงลูกค้า: {cid}\n\nเราเก็บประวัติการติดต่อครั้งนี้ไว้ใน customer memory แล้ว ครั้งต่อไปถ้าคุณใช้เบอร์/อีเมล/LINE ID เดิม ระบบจะรู้จักคุณโดยไม่ต้องเริ่มใหม่\n\nทีมงานจะติดต่อกลับตามช่องทางที่คุณระบุไว้เร็ว ๆ นี้\n\nBlutenstein".format(name=lead.name, cid=memory["customer_id"]),
+        memory["customer_id"],
+    )
+    return {
+        "status": "ok",
+        "message": "received",
+        "customer_id": memory["customer_id"],
+        "returning_customer": memory["returning_customer"],
+        "user_feedback": user_receipt_text("demo", memory["customer_id"], memory["returning_customer"]),
+        "direct_reply_capabilities": {
+            "line_direct": "requires LINE userId captured by LINE webhook/LIFF; public LINE ID or phone number alone cannot be pushed to",
+            "telegram_direct": "requires Telegram chat_id after the user starts the bot; phone number cannot be mapped by bot API",
+            "instagram_direct": "requires Instagram Messaging API conversation permission; handle alone is not enough",
+            "email": "sent" if email_ok else "not-configured-or-no-email",
+        },
+        "notifications": {"telegram": telegram_ok, "line": line_ok, "email": email_ok},
+    }
 
 
 
@@ -190,6 +477,8 @@ class SuccessCastingOrder(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     phone: Optional[str] = Field(default=None, max_length=80)
     email: Optional[str] = Field(default=None, max_length=180)
+    line_id: Optional[str] = Field(default=None, max_length=120)
+    instagram: Optional[str] = Field(default=None, max_length=120)
     note: Optional[str] = Field(default=None, max_length=600)
 
 
@@ -245,7 +534,21 @@ async def successcasting_order(order: SuccessCastingOrder):
     if not product:
         return {"status": "not-found", "message": "unknown sku"}
     total = int(product["price"]) * int(order.quantity)
+    memory = remember_customer(
+        source="successcasting_order_form",
+        name=order.name,
+        email=order.email,
+        phone=order.phone,
+        line_id=order.line_id,
+        instagram=order.instagram,
+        preferred_contact="order-form",
+        subject="SuccessCasting catalog order",
+        body=order.note,
+        payload={"sku": order.sku, "quantity": order.quantity, "total": total, "product": product},
+    )
     message = "🛒 SuccessCasting catalog order\n" + "\n".join([
+        f"Customer ID: {memory['customer_id']}",
+        f"Returning: {memory['returning_customer']}",
         f"SKU: {order.sku}",
         f"Product: {product['name']}",
         f"Qty: {order.quantity}",
@@ -253,11 +556,28 @@ async def successcasting_order(order: SuccessCastingOrder):
         f"Name: {order.name}",
         f"Phone/LINE: {order.phone or '-'}",
         f"Email: {order.email or '-'}",
+        f"LINE ID: {order.line_id or '-'}",
+        f"Instagram: {order.instagram or '-'}",
         f"Note: {order.note or '-'}",
     ])
     telegram_ok = await send_telegram(message)
     line_ok = await send_line(message)
-    return {"status": "ok", "sku": order.sku, "quantity": order.quantity, "total": total, "notifications": {"telegram": telegram_ok, "line": line_ok}}
+    email_ok = await send_email_feedback(
+        order.email,
+        "SuccessCasting ได้รับคำสั่งซื้อ/ขอใบเสนอราคาแล้ว",
+        "สวัสดีครับ/ค่ะ {name}\n\nเราได้รับคำสั่งซื้อ/ขอใบเสนอราคาของคุณแล้ว\nสินค้า: {product}\nจำนวน: {qty}\nยอดประมาณการ: ฿{total:,}\nเลขอ้างอิงลูกค้า: {cid}\n\nระบบจดจำข้อมูลการติดต่อครั้งนี้ไว้แล้ว ครั้งต่อไปใช้เบอร์/อีเมล/LINE ID เดิมได้เลย\n\nทีมงานจะติดต่อกลับเร็ว ๆ นี้\n\nSuccessCasting x Blutenstein".format(name=order.name, product=product['name'], qty=order.quantity, total=total, cid=memory["customer_id"]),
+        memory["customer_id"],
+    )
+    return {
+        "status": "ok",
+        "sku": order.sku,
+        "quantity": order.quantity,
+        "total": total,
+        "customer_id": memory["customer_id"],
+        "returning_customer": memory["returning_customer"],
+        "user_feedback": user_receipt_text("successcasting_order", memory["customer_id"], memory["returning_customer"]),
+        "notifications": {"telegram": telegram_ok, "line": line_ok, "email": email_ok},
+    }
 
 
 @app.get("/successcasting", response_class=HTMLResponse)
@@ -294,12 +614,12 @@ def successcasting_html() -> str:
 <main class='hero'><div><div class='badge'>SuccessCasting live stock catalog · Pulley inventory online</div><h1>ร้านมู่เล่ย์ที่ไม่ต้องนับ stock ด้วยมือ <span>ทุกออเดอร์เข้าระบบเดียว</span></h1><p class='lead'>นี่คือตัวอย่างลูกค้ารายแรกแบบขายจริง: SuccessCasting catalog มีรูปสินค้า ราคา stock และฟอร์มสั่งซื้อที่แจ้งทีมผ่าน LINE/Telegram ทันที จากนั้นเชื่อม Shopee/Lazada/TikTok webhook เข้ากับ n8n + factory API ได้</p><div class='cta'><a class='btn primary' href='#catalog'>ดูสินค้า</a><a class='btn' href='#connectors'>ดูแผนเชื่อม Marketplace จริง</a></div></div><div class='panel'><div class='stats'><div class='stat'><small>Products imported</small><b>{len(SUCCESSCASTING_PRODUCTS)}</b></div><div class='stat'><small>Total stock</small><b>{sum(p['stock'] for p in SUCCESSCASTING_PRODUCTS)}</b></div><div class='stat'><small>Alerts</small><b>LINE ✓</b></div><div class='stat'><small>Mode</small><b>Live page</b></div></div></div></main></div>
 <section id='catalog'><div class='wrap'><h2>Catalog มู่เล่ย์พร้อม stock</h2><p class='sub'>ข้อมูลสินค้าจาก SuccessCasting ถูกจัดเป็น live catalog พร้อม SKU, ราคา, stock และรูปสินค้า โดยไม่ใส่ secret ใน repo</p><div class='grid'>{products_html}</div></div></section>
 <section id='connectors'><div class='wrap'><h2>ทางเชื่อม Shopee / Lazada / TikTok จริง</h2><p class='sub'>Blutenstein เตรียม endpoint/webhook และ safe-mode แล้ว ขั้นต่อไปคือใส่ official app credentials ของแต่ละ marketplace แล้วค่อยเปลี่ยนจาก mock เป็น live</p><div class='connectors'>{connector_rows}</div></div></section>
-<section id='order'><div class='wrap formgrid'><div class='panel'><h2>สั่งตัวอย่าง / ขอใบเสนอราคา</h2><p class='sub'>ฟอร์มนี้ยิงเข้า `/api/successcasting/order` แล้วส่งแจ้งเตือน LINE + Telegram จริง</p><ul class='sub'><li>รับสั่งรูเพลา/ร่องลิ่มตามแบบ</li><li>ทีมงานตอบกลับผ่าน LINE/โทรศัพท์</li><li>ต่อ marketplace ได้เมื่อมี official credentials</li></ul></div><div class='panel'><form id='orderForm'><select name='sku' id='sku'>{''.join(f"<option value='{p['sku']}'>{p['sku']} — ฿{int(p['price']):,}</option>" for p in SUCCESSCASTING_PRODUCTS)}</select><input name='quantity' type='number' min='1' max='100' value='1'><input name='name' placeholder='ชื่อผู้ติดต่อ' required><input name='phone' placeholder='เบอร์โทร / LINE'><input name='email' placeholder='อีเมล'><textarea name='note' placeholder='ต้องการรูเพลา/ร่องลิ่ม/จำนวน/จัดส่งอย่างไร'></textarea><button class='btn primary' type='submit'>ส่งคำสั่งซื้อเข้าระบบ</button><div id='result'></div></form></div></div></section>
+<section id='order'><div class='wrap formgrid'><div class='panel'><h2>สั่งตัวอย่าง / ขอใบเสนอราคา</h2><p class='sub'>ฟอร์มนี้ยิงเข้า `/api/successcasting/order` แล้วส่งแจ้งเตือน LINE + Telegram จริง</p><ul class='sub'><li>รับสั่งรูเพลา/ร่องลิ่มตามแบบ</li><li>ทีมงานตอบกลับผ่าน LINE/โทรศัพท์</li><li>ต่อ marketplace ได้เมื่อมี official credentials</li></ul></div><div class='panel'><form id='orderForm'><select name='sku' id='sku'>{''.join(f"<option value='{p['sku']}'>{p['sku']} — ฿{int(p['price']):,}</option>" for p in SUCCESSCASTING_PRODUCTS)}</select><input name='quantity' type='number' min='1' max='100' value='1'><input name='name' placeholder='ชื่อผู้ติดต่อ' required><input name='phone' placeholder='เบอร์โทร'><input name='email' placeholder='อีเมล'><input name='line_id' placeholder='LINE ID (ถ้ามี)'><input name='instagram' placeholder='Instagram (ถ้ามี)'><textarea name='note' placeholder='ต้องการรูเพลา/ร่องลิ่ม/จำนวน/จัดส่งอย่างไร'></textarea><button class='btn primary' type='submit'>ส่งคำสั่งซื้อเข้าระบบ</button><div id='result'></div></form></div></div></section>
 <footer><div class='wrap'>SuccessCasting live customer example powered by Blutenstein · Marketplace-to-Factory Automation OS</div></footer>
 <script>
 function selectSku(sku,name){{document.getElementById('sku').value=sku; location.hash='order';}}
 const f=document.getElementById('orderForm'), r=document.getElementById('result');
-f.addEventListener('submit', async e=>{{e.preventDefault(); r.textContent='กำลังส่ง...'; const data=Object.fromEntries(new FormData(f).entries()); data.quantity=Number(data.quantity||1); try{{const res=await fetch('/api/successcasting/order',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(data)}}); const j=await res.json(); r.textContent=j.status==='ok'?'ส่งเข้าระบบแล้ว แจ้งทีมผ่าน LINE/Telegram สำเร็จ':'ส่งไม่สำเร็จ'; if(j.status==='ok') f.reset();}}catch(err){{r.textContent='เชื่อมต่อไม่ได้ กรุณาลองใหม่';}} }});
+f.addEventListener('submit', async e=>{{e.preventDefault(); r.textContent='กำลังส่ง...'; const data=Object.fromEntries(new FormData(f).entries()); data.quantity=Number(data.quantity||1); try{{const res=await fetch('/api/successcasting/order',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(data)}}); const j=await res.json(); r.textContent=j.status==='ok'?(j.user_feedback || 'ส่งเข้าระบบแล้ว แจ้งทีมผ่าน LINE/Telegram สำเร็จ'):'ส่งไม่สำเร็จ'; if(j.status==='ok') f.reset();}}catch(err){{r.textContent='เชื่อมต่อไม่ได้ กรุณาลองใหม่';}} }});
 </script></body></html>"""
 
 @app.get("/", response_class=HTMLResponse)
@@ -371,11 +691,11 @@ HTML = """<!doctype html>
   <section class="dark-band"><div class="wrap section" id="templates"><div class="section-head"><h2>Template engine สำหรับโรงงานไทยที่อยากเริ่มเร็ว</h2><p class="sub">เริ่มจาก workflow ที่ผ่าน end-to-end test แล้ว แล้ว clone เป็นระบบของลูกค้าแต่ละโรงงานได้โดยไม่สร้างใหม่จากศูนย์</p></div><div class="templates"><div class="workflow"><div class="node"><b>Marketplace Backbone</b><span>webhook → verify → normalize</span></div><div class="node"><b>Inventory Ledger</b><span>save order → deduct stock</span></div><div class="node"><b>Low Stock Ritual</b><span>velocity → reorder alert</span></div><div class="node"><b>Owner Morning Brief</b><span>sales → risk → action list</span></div></div><div class="terminal"><b>blutenstein.sync()</b><br>order.platform = <em>"shopee"</em><br>sku.delta = -4<br>ledger.reason = <em>"order_deduction"</em><br>alert.telegram = true<br>alert.line = true<br><br><b>Result:</b> one calm operating layer for owner + team</div></div></div></section>
   <section id="roadmap" class="section"><div class="wrap"><div class="section-head"><h2>Roadmap แบบ startup ที่ไม่เผาเงิน</h2><p class="sub">เริ่มจาก single-server MVP ที่ใช้งานได้จริง แล้วค่อยยกระดับเป็น multi-tenant SaaS เมื่อมี pilot และ revenue</p></div><div class="timeline"><div class="card phase"><b>MONTH 1-2</b><h3>MVP</h3><p>Portal, order intake, inventory ledger, LINE/Telegram alerts, first pilot</p></div><div class="card phase"><b>MONTH 3-4</b><h3>Paid beta</h3><p>Onboarding wizard, tenant templates, AI daily summary, error inbox</p></div><div class="card phase"><b>MONTH 5-6</b><h3>Reliability</h3><p>Postgres, queue, backups, monitoring, restore drills, audit exports</p></div><div class="card phase"><b>MONTH 7-12</b><h3>Scale</h3><p>Template marketplace, agency onboarding, enterprise isolation, Thai/EN switch</p></div></div></div></section>
   <section id="pricing" class="section"><div class="wrap"><div class="section-head"><h2>ราคาให้ SME ไทยกล้าลอง แต่โตไปกับระบบได้</h2><p class="sub">แพ็กเกจเริ่มจาก order + stock automation ก่อน แล้วค่อยขยายไป production ops, BOM, approval และ analytics</p></div><div class="pricing"><div class="card price"><h3>Starter</h3><p>เริ่มจัดระเบียบ order + stock</p><div class="amount">฿990–1,990</div><ul><li>1-2 sales channels</li><li>Inventory + stock ledger</li><li>Basic daily report</li><li>LINE/Telegram alert basic</li></ul></div><div class="card price featured"><h3>Growth</h3><p>สำหรับ seller/factory หลายช่องทาง</p><div class="amount">฿3,900–7,900</div><ul><li>Shopee, Lazada, TikTok, Facebook</li><li>Workflow templates</li><li>Low-stock + exception alerts</li><li>Setup support included</li></ul></div><div class="card price"><h3>Factory Ops</h3><p>สำหรับโรงงานที่ต้อง custom</p><div class="amount">฿12,000+</div><ul><li>Production task board</li><li>BOM/material checks</li><li>Approval workflows</li><li>Custom dashboard + priority support</li></ul></div></div></div></section>
-  <section id="demo" class="section"><div class="wrap form-wrap"><div class="card"><span class="eyebrow"><span class="pulse"></span> Pilot slots open</span><h2 style="font-size:clamp(40px,5vw,64px);line-height:.96;letter-spacing:-.065em;font-weight:300;margin:24px 0 18px">ให้ Blutenstein วาด workflow จริงของโรงงานคุณ</h2><p class="sub">ส่งข้อมูลมา ระบบจะบันทึกเป็น waitlist และแจ้งทีมผ่าน Telegram + LINE ทันที โดย token ทั้งหมดอ่านจาก environment variables เท่านั้น ไม่มี secret อยู่ใน code</p></div><div class="card"><form id="lead" class="form"><input name="name" placeholder="ชื่อ" required><input name="company" placeholder="บริษัท / ร้าน / โรงงาน"><input name="phone" placeholder="เบอร์โทร / LINE"><input name="email" placeholder="อีเมล"><input name="channels" placeholder="ขายผ่านช่องทางไหน เช่น Shopee, Lazada, TikTok"><textarea name="message" placeholder="ปัญหาหลังบ้านที่อยากแก้ เช่น สต๊อกไม่ตรง, oversell, report ช้า"></textarea><button class="btn primary" type="submit">ส่งคำขอ Demo</button><div id="result" class="result"></div></form></div></div></section>
+  <section id="demo" class="section"><div class="wrap form-wrap"><div class="card"><span class="eyebrow"><span class="pulse"></span> Pilot slots open</span><h2 style="font-size:clamp(40px,5vw,64px);line-height:.96;letter-spacing:-.065em;font-weight:300;margin:24px 0 18px">ให้ Blutenstein วาด workflow จริงของโรงงานคุณ</h2><p class="sub">ส่งข้อมูลมา ระบบจะบันทึกเป็น waitlist และแจ้งทีมผ่าน Telegram + LINE ทันที โดย token ทั้งหมดอ่านจาก environment variables เท่านั้น ไม่มี secret อยู่ใน code</p></div><div class="card"><form id="lead" class="form"><input name="name" placeholder="ชื่อ" required><input name="company" placeholder="บริษัท / ร้าน / โรงงาน"><input name="phone" placeholder="เบอร์โทร"><input name="email" placeholder="อีเมล"><input name="line_id" placeholder="LINE ID (ถ้ามี)"><input name="instagram" placeholder="Instagram (ถ้ามี)"><input name="preferred_contact" placeholder="อยากให้ติดต่อกลับทางไหน เช่น email / LINE / โทร"><input name="channels" placeholder="ขายผ่านช่องทางไหน เช่น Shopee, Lazada, TikTok"><textarea name="message" placeholder="ปัญหาหลังบ้านที่อยากแก้ เช่น สต๊อกไม่ตรง, oversell, report ช้า"></textarea><button class="btn primary" type="submit">ส่งคำขอ Demo</button><div id="result" class="result"></div></form></div></div></section>
   <footer class="footer"><div class="wrap footerin"><div><b>Blutenstein</b><br>AI-powered factory automation OS for Thai SME factories.</div><div class="mono">https://www.blutenstein.com · portal v0.3.0</div></div></footer>
 <script>
 const form=document.getElementById('lead'), result=document.getElementById('result');
-form.addEventListener('submit', async e=>{e.preventDefault(); result.textContent='กำลังส่ง...'; const data=Object.fromEntries(new FormData(form).entries()); try{const r=await fetch('/api/waitlist',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)}); const j=await r.json(); result.textContent = j.status==='ok' ? 'ส่งเรียบร้อย ทีมงานจะติดต่อกลับเร็ว ๆ นี้' : 'ส่งไม่สำเร็จ กรุณาลองใหม่'; if(j.status==='ok') form.reset();}catch(err){result.textContent='เชื่อมต่อไม่ได้ กรุณาลองใหม่อีกครั้ง';}});
+form.addEventListener('submit', async e=>{e.preventDefault(); result.textContent='กำลังส่ง...'; const data=Object.fromEntries(new FormData(form).entries()); try{const r=await fetch('/api/waitlist',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)}); const j=await r.json(); result.textContent = j.status==='ok' ? (j.user_feedback || 'ส่งเรียบร้อย ทีมงานจะติดต่อกลับเร็ว ๆ นี้') : 'ส่งไม่สำเร็จ กรุณาลองใหม่'; if(j.status==='ok') form.reset();}catch(err){result.textContent='เชื่อมต่อไม่ได้ กรุณาลองใหม่อีกครั้ง';}});
 </script>
 </body>
 </html>"""
