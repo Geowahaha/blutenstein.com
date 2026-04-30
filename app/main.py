@@ -11,14 +11,18 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+
+from app.successcasting_data import SUCCESSCASTING_PRODUCTS
 
 load_dotenv()
 
 APP_ENV = os.getenv("APP_ENV", "production")
 WAITLIST_STORE = Path(os.getenv("WAITLIST_STORE", "/data/waitlist.jsonl"))
 
-app = FastAPI(title="Blutenstein Portal", version="0.3.0")
+app = FastAPI(title="Blutenstein Portal", version="0.4.0")
+app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 
 class WaitlistLead(BaseModel):
@@ -88,7 +92,7 @@ def healthz():
         "status": "ok",
         "app": "blutenstein-portal",
         "env": APP_ENV,
-        "version": "0.3.0",
+        "version": "0.4.0",
         "notifications": {
             "telegram_token": bool(os.getenv("BlutensteinTelegrambot_API") or os.getenv("TELEGRAM_BOT_TOKEN")),
             "telegram_chat": bool(os.getenv("BlutensteinTelegram_ID") or os.getenv("TELEGRAM_CHAT_ID")),
@@ -177,6 +181,126 @@ async def waitlist(lead: WaitlistLead, request: Request):
     line_ok = await send_line(text)
     return {"status": "ok", "message": "received", "notifications": {"telegram": telegram_ok, "line": line_ok}}
 
+
+
+
+class SuccessCastingOrder(BaseModel):
+    sku: str = Field(min_length=1, max_length=80)
+    quantity: int = Field(default=1, ge=1, le=100)
+    name: str = Field(min_length=1, max_length=120)
+    phone: Optional[str] = Field(default=None, max_length=80)
+    email: Optional[str] = Field(default=None, max_length=180)
+    note: Optional[str] = Field(default=None, max_length=600)
+
+
+def marketplace_connector_status() -> dict:
+    platforms = {
+        "shopee": {
+            "required": ["SHOPEE_PARTNER_ID", "SHOPEE_PARTNER_KEY", "SHOPEE_SHOP_ID"],
+            "webhook": "https://hooks.blutenstein.com/webhook/shopee/orders",
+            "mode": "ready-for-credentials",
+        },
+        "lazada": {
+            "required": ["LAZADA_APP_KEY", "LAZADA_APP_SECRET", "LAZADA_SELLER_ID", "LAZADA_ACCESS_TOKEN"],
+            "webhook": "https://hooks.blutenstein.com/webhook/lazada/orders",
+            "mode": "ready-for-credentials",
+        },
+        "tiktok": {
+            "required": ["TIKTOK_APP_KEY", "TIKTOK_APP_SECRET", "TIKTOK_SHOP_ID", "TIKTOK_ACCESS_TOKEN"],
+            "webhook": "https://hooks.blutenstein.com/webhook/tiktok/orders",
+            "mode": "ready-for-credentials",
+        },
+    }
+    out = {}
+    for name, cfg in platforms.items():
+        present = {k: bool(os.getenv(k)) for k in cfg["required"]}
+        out[name] = {
+            "status": "live-ready" if all(present.values()) else "needs-credentials",
+            "present": present,
+            "missing": [k for k, ok in present.items() if not ok],
+            "webhook": cfg["webhook"],
+            "safe_mode": "mock until official credentials are installed and verified",
+        }
+    return out
+
+
+@app.get("/api/marketplaces/connectors/status")
+def marketplace_connectors_status():
+    return marketplace_connector_status()
+
+
+@app.get("/api/successcasting/products")
+def successcasting_products():
+    return {
+        "customer": "SuccessCasting",
+        "source": "มูเล่ย์all.xlsx",
+        "count": len(SUCCESSCASTING_PRODUCTS),
+        "products": SUCCESSCASTING_PRODUCTS,
+    }
+
+
+@app.post("/api/successcasting/order")
+async def successcasting_order(order: SuccessCastingOrder):
+    product = next((p for p in SUCCESSCASTING_PRODUCTS if p["sku"] == order.sku), None)
+    if not product:
+        return {"status": "not-found", "message": "unknown sku"}
+    total = int(product["price"]) * int(order.quantity)
+    message = "🛒 SuccessCasting catalog order\n" + "\n".join([
+        f"SKU: {order.sku}",
+        f"Product: {product['name']}",
+        f"Qty: {order.quantity}",
+        f"Total: ฿{total:,}",
+        f"Name: {order.name}",
+        f"Phone/LINE: {order.phone or '-'}",
+        f"Email: {order.email or '-'}",
+        f"Note: {order.note or '-'}",
+    ])
+    telegram_ok = await send_telegram(message)
+    line_ok = await send_line(message)
+    return {"status": "ok", "sku": order.sku, "quantity": order.quantity, "total": total, "notifications": {"telegram": telegram_ok, "line": line_ok}}
+
+
+@app.get("/successcasting", response_class=HTMLResponse)
+def successcasting_page():
+    return HTMLResponse(successcasting_html())
+
+
+def successcasting_html() -> str:
+    cards = []
+    for p in SUCCESSCASTING_PRODUCTS:
+        details = "".join(f"<li>{d}</li>" for d in p.get("details", [])[:3])
+        low = " low" if p["stock"] <= p["safety_stock"] + 10 else ""
+        cards.append(f"""
+        <article class="product{low}" data-sku="{p['sku']}">
+          <img src="{p['image']}" alt="{p['name']}" loading="lazy">
+          <div class="pbody">
+            <div class="sku">{p['sku']}</div>
+            <h3>{p['name']}</h3>
+            <ul>{details}</ul>
+            <div class="buyrow"><strong>฿{int(p['price']):,}</strong><span>stock {int(p['stock'])}</span></div>
+            <button onclick="selectSku('{p['sku']}','{p['name'].replace("'", "")}')">สั่งตัวอย่าง / ขอใบเสนอราคา</button>
+          </div>
+        </article>""")
+    connectors = marketplace_connector_status()
+    connector_rows = "".join(f"<div class='conn'><b>{name.title()}</b><span>{cfg['status']}</span><code>{cfg['webhook']}</code></div>" for name, cfg in connectors.items())
+    products_html = "\n".join(cards)
+    return f"""<!doctype html><html lang='th'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>SuccessCasting x Blutenstein — มู่เล่ย์พร้อม stock จริง</title>
+<meta name='description' content='ตัวอย่างลูกค้าใช้งานจริง SuccessCasting: catalog มู่เล่ย์พร้อม stock, รูปสินค้า, order form และ automation alerts ผ่าน Blutenstein'>
+<style>
+:root{{--ink:#07162f;--muted:#667085;--blue:#533afd;--pink:#f96bee;--cyan:#25d0ff;--green:#15be53;--line:#e5edf5;--bg:#f6f9fc}}
+*{{box-sizing:border-box}}body{{margin:0;background:radial-gradient(circle at 10% 0%,rgba(249,107,238,.22),transparent 30%),radial-gradient(circle at 90% 0%,rgba(37,208,255,.18),transparent 32%),var(--bg);font-family:Inter,ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif;color:var(--ink)}}a{{color:inherit;text-decoration:none}}.wrap{{max-width:1180px;margin:auto;padding:0 22px}}nav{{height:68px;display:flex;align-items:center;justify-content:space-between}}.brand{{font-weight:850;letter-spacing:-.04em}}.badge{{display:inline-flex;gap:8px;align-items:center;border:1px solid #d6d9fc;background:white;color:#362baa;padding:8px 12px;border-radius:999px;font-size:13px}}.hero{{display:grid;grid-template-columns:1.02fr .98fr;gap:34px;align-items:center;padding:56px 0 38px}}h1{{font-size:clamp(44px,7vw,90px);line-height:1;letter-spacing:-.07em;margin:20px 0 18px}}h1 span{{color:transparent;background:linear-gradient(90deg,var(--blue),#ea2261,var(--pink));-webkit-background-clip:text;background-clip:text}}.lead{{font-size:21px;color:var(--muted);line-height:1.45;max-width:760px}}.cta{{display:flex;gap:12px;flex-wrap:wrap;margin-top:24px}}.btn{{border:1px solid #b9b9f9;background:white;color:var(--blue);border-radius:8px;padding:13px 18px;font-weight:750;cursor:pointer}}.btn.primary{{background:var(--blue);border-color:var(--blue);color:white}}.panel{{background:white;border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:rgba(50,50,93,.25) 0 30px 45px -30px,rgba(0,0,0,.1) 0 18px 36px -18px}}.stats{{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}}.stat{{background:#10113d;color:white;border-radius:14px;padding:18px}}.stat small{{color:#b9c2e6}}.stat b{{display:block;font-size:34px;letter-spacing:-.05em;margin-top:8px}}section{{padding:62px 0}}h2{{font-size:clamp(34px,5vw,60px);line-height:1.04;letter-spacing:-.055em;margin:0 0 18px}}.sub{{color:var(--muted);font-size:18px}}.grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}}.product{{background:white;border:1px solid var(--line);border-radius:18px;overflow:hidden;box-shadow:rgba(23,23,23,.07) 0 15px 35px}}.product img{{width:100%;height:230px;object-fit:cover;background:#eef2f8}}.pbody{{padding:18px}}.sku{{font:12px ui-monospace,monospace;color:var(--blue);background:#f1f0ff;display:inline-block;padding:5px 7px;border-radius:6px}}.product h3{{font-size:22px;line-height:1.12;margin:14px 0 10px;letter-spacing:-.035em}}.product ul{{min-height:74px;color:var(--muted);padding-left:20px}}.buyrow{{display:flex;justify-content:space-between;align-items:center;margin:14px 0}}.buyrow strong{{font-size:27px}}.buyrow span{{color:#108c3d;background:rgba(21,190,83,.13);border:1px solid rgba(21,190,83,.25);padding:5px 8px;border-radius:999px}}.product button{{width:100%;border:0;background:#10113d;color:white;padding:13px;border-radius:10px;font-weight:800;cursor:pointer}}.connectors{{display:grid;gap:10px}}.conn{{display:grid;grid-template-columns:120px 180px 1fr;gap:12px;align-items:center;background:#07162f;color:white;padding:14px;border-radius:12px}}.conn span{{color:#b7ffd0}}.conn code{{color:#c8d2ff;overflow:auto}}.formgrid{{display:grid;grid-template-columns:.9fr 1.1fr;gap:18px}}form{{display:grid;gap:12px}}input,textarea,select{{width:100%;border:1px solid var(--line);border-radius:10px;padding:14px;font:inherit}}textarea{{min-height:110px}}#result{{color:#108c3d;font-weight:800;min-height:24px}}footer{{padding:34px 0;color:var(--muted);border-top:1px solid var(--line);background:white}}@media(max-width:900px){{.hero,.grid,.formgrid{{grid-template-columns:1fr}}.conn{{grid-template-columns:1fr}}}}
+</style></head><body><div class='wrap'><nav><a class='brand' href='/'>Blutenstein × SuccessCasting</a><a class='btn' href='https://www.blutenstein.com'>Blutenstein main</a></nav>
+<main class='hero'><div><div class='badge'>สินค้า sample จากไฟล์ มูเล่ย์all.xlsx · Stock catalog live</div><h1>ร้านมู่เล่ย์ที่ไม่ต้องนับ stock ด้วยมือ <span>ทุกออเดอร์เข้าระบบเดียว</span></h1><p class='lead'>นี่คือตัวอย่างลูกค้ารายแรกแบบขายจริง: SuccessCasting catalog มีรูปสินค้า ราคา stock และฟอร์มสั่งซื้อที่แจ้งทีมผ่าน LINE/Telegram ทันที จากนั้นต่อ Shopee/Lazada/TikTok webhook เข้ากับ n8n + factory API ได้</p><div class='cta'><a class='btn primary' href='#catalog'>ดูสินค้า</a><a class='btn' href='#connectors'>ดูแผนเชื่อม Marketplace จริง</a></div></div><div class='panel'><div class='stats'><div class='stat'><small>Products imported</small><b>{len(SUCCESSCASTING_PRODUCTS)}</b></div><div class='stat'><small>Total stock</small><b>{sum(p['stock'] for p in SUCCESSCASTING_PRODUCTS)}</b></div><div class='stat'><small>Alerts</small><b>LINE ✓</b></div><div class='stat'><small>Mode</small><b>Live page</b></div></div></div></main></div>
+<section id='catalog'><div class='wrap'><h2>Catalog มู่เล่ย์พร้อม stock</h2><p class='sub'>ข้อมูลสินค้าเริ่มต้นถูกดึงจาก Excel ของ SuccessCasting และใช้รูปที่แนบมาในไฟล์นั้น ไม่ใส่ secret ใน repo</p><div class='grid'>{products_html}</div></div></section>
+<section id='connectors'><div class='wrap'><h2>ทางเชื่อม Shopee / Lazada / TikTok จริง</h2><p class='sub'>Blutenstein เตรียม endpoint/webhook และ safe-mode แล้ว ขั้นต่อไปคือใส่ official app credentials ของแต่ละ marketplace แล้วค่อยเปลี่ยนจาก mock เป็น live</p><div class='connectors'>{connector_rows}</div></div></section>
+<section id='order'><div class='wrap formgrid'><div class='panel'><h2>สั่งตัวอย่าง / ขอใบเสนอราคา</h2><p class='sub'>ฟอร์มนี้ยิงเข้า `/api/successcasting/order` แล้วส่งแจ้งเตือน LINE + Telegram จริง</p></div><div class='panel'><form id='orderForm'><select name='sku' id='sku'>{''.join(f"<option value='{p['sku']}'>{p['sku']} — ฿{int(p['price']):,}</option>" for p in SUCCESSCASTING_PRODUCTS)}</select><input name='quantity' type='number' min='1' max='100' value='1'><input name='name' placeholder='ชื่อผู้ติดต่อ' required><input name='phone' placeholder='เบอร์โทร / LINE'><input name='email' placeholder='อีเมล'><textarea name='note' placeholder='ต้องการรูเพลา/ร่องลิ่ม/จำนวน/จัดส่งอย่างไร'></textarea><button class='btn primary' type='submit'>ส่งคำสั่งซื้อเข้าระบบ</button><div id='result'></div></form></div></div></section>
+<footer><div class='wrap'>SuccessCasting live customer example powered by Blutenstein · Marketplace-to-Factory Automation OS</div></footer>
+<script>
+function selectSku(sku,name){{document.getElementById('sku').value=sku; location.hash='order';}}
+const f=document.getElementById('orderForm'), r=document.getElementById('result');
+f.addEventListener('submit', async e=>{{e.preventDefault(); r.textContent='กำลังส่ง...'; const data=Object.fromEntries(new FormData(f).entries()); data.quantity=Number(data.quantity||1); try{{const res=await fetch('/api/successcasting/order',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(data)}}); const j=await res.json(); r.textContent=j.status==='ok'?'ส่งเข้าระบบแล้ว แจ้งทีมผ่าน LINE/Telegram สำเร็จ':'ส่งไม่สำเร็จ'; if(j.status==='ok') f.reset();}}catch(err){{r.textContent='เชื่อมต่อไม่ได้ กรุณาลองใหม่';}} }});
+</script></body></html>"""
 
 @app.get("/", response_class=HTMLResponse)
 def landing():
