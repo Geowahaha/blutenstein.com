@@ -1,3 +1,6 @@
+import base64
+import hashlib
+import hmac
 import json
 import os
 from datetime import datetime, timezone
@@ -42,9 +45,32 @@ async def send_telegram(text: str) -> bool:
         return resp.status_code < 300
 
 
+def line_access_token() -> str | None:
+    return (
+        os.getenv("Blutenstein_LINEChannel_access_token_long-lived")
+        or os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+        or os.getenv("LINE_MESSAGING_CHANNEL_ACCESS_TOKEN")
+    )
+
+
+def line_target() -> str | None:
+    # LINE Notify ended service on 2025-03-31. This app uses LINE Messaging API Push.
+    # Push requires a userId/groupId/roomId captured from a LINE webhook event.
+    return (
+        os.getenv("LINE_MESSAGING_TO")
+        or os.getenv("LINE_NOTIFY_TO")  # legacy alias only; value must be Messaging API userId/groupId/roomId
+        or os.getenv("LINE_USER_ID")
+        or os.getenv("LINE_GROUP_ID")
+        or os.getenv("LINE_ROOM_ID")
+        or os.getenv("Blutenstein_LINE_USER_ID")
+        or os.getenv("Blutenstein_LINE_GROUP_ID")
+        or os.getenv("Blutenstein_LINE_ROOM_ID")
+    )
+
+
 async def send_line(text: str) -> bool:
-    token = os.getenv("Blutenstein_LINEChannel_access_token_long-lived") or os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-    to = os.getenv("LINE_NOTIFY_TO") or os.getenv("LINE_USER_ID") or os.getenv("LINE_GROUP_ID")
+    token = line_access_token()
+    to = line_target()
     if not token or not to:
         return False
     async with httpx.AsyncClient(timeout=10) as client:
@@ -66,8 +92,9 @@ def healthz():
         "notifications": {
             "telegram_token": bool(os.getenv("BlutensteinTelegrambot_API") or os.getenv("TELEGRAM_BOT_TOKEN")),
             "telegram_chat": bool(os.getenv("BlutensteinTelegram_ID") or os.getenv("TELEGRAM_CHAT_ID")),
-            "line_token": bool(os.getenv("Blutenstein_LINEChannel_access_token_long-lived") or os.getenv("LINE_CHANNEL_ACCESS_TOKEN")),
-            "line_target": bool(os.getenv("LINE_NOTIFY_TO") or os.getenv("LINE_USER_ID") or os.getenv("LINE_GROUP_ID")),
+            "line_token": bool(line_access_token()),
+            "line_target": bool(line_target()),
+            "line_transport": "messaging_api_push",
         },
     }
 
@@ -85,9 +112,44 @@ def integrations_status():
         },
         "notifications": {
             "telegram": "configured" if os.getenv("BlutensteinTelegrambot_API") else "needs-env",
-            "line": "configured" if os.getenv("Blutenstein_LINEChannel_access_token_long-lived") else "needs-env",
+            "line": "configured" if line_access_token() else "needs-env",
+            "line_transport": "LINE Messaging API push (LINE Notify retired 2025-03-31)",
+            "line_target": "configured" if line_target() else "needs-userId-or-groupId-from-webhook",
         },
     }
+
+
+@app.post("/api/line/webhook")
+async def line_webhook(request: Request):
+    """LINE Messaging API webhook.
+
+    Replacement for retired LINE Notify: ask an admin/user/group to message the LINE bot,
+    then use the returned source.userId/groupId/roomId as LINE_MESSAGING_TO in .env.
+    """
+    body = await request.body()
+    channel_secret = os.getenv("BlutensteinL_INEChannel_secret") or os.getenv("LINE_CHANNEL_SECRET")
+    if channel_secret:
+        signature = request.headers.get("x-line-signature", "")
+        digest = hmac.new(channel_secret.encode(), body, hashlib.sha256).digest()
+        expected = base64.b64encode(digest).decode()
+        if not hmac.compare_digest(signature, expected):
+            return {"status": "invalid-signature"}
+
+    payload = json.loads(body.decode("utf-8") or "{}")
+    sources = []
+    for event in payload.get("events", []):
+        source = event.get("source", {})
+        target = source.get("userId") or source.get("groupId") or source.get("roomId")
+        if target:
+            sources.append({"type": source.get("type"), "target": target, "event": event.get("type")})
+
+    if sources:
+        WAITLIST_STORE.parent.mkdir(parents=True, exist_ok=True)
+        with (WAITLIST_STORE.parent / "line_sources.jsonl").open("a", encoding="utf-8") as f:
+            for source in sources:
+                f.write(json.dumps({"created_at": datetime.now(timezone.utc).isoformat(), **source}, ensure_ascii=False) + "\n")
+
+    return {"status": "ok", "sources_found": len(sources), "next_env": "set LINE_MESSAGING_TO to the captured target"}
 
 
 @app.post("/api/waitlist")
