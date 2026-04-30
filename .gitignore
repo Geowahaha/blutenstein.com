@@ -1,0 +1,5 @@
+.env
+__pycache__/
+*.pyc
+.waitlist.jsonl
+.pytest_cache/

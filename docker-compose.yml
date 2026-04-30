@@ -1,0 +1,13 @@
+services:
+  blutenstein-portal:
+    build: .
+    container_name: blutenstein-portal
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - blutenstein_portal_data:/data
+volumes:
+  blutenstein_portal_data:

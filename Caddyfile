@@ -1,0 +1,19 @@
+blutenstein.com, www.blutenstein.com {
+  encode gzip zstd
+  reverse_proxy 127.0.0.1:8080
+}
+
+app.blutenstein.com {
+  encode gzip zstd
+  reverse_proxy 127.0.0.1:8080
+}
+
+api.blutenstein.com {
+  encode gzip zstd
+  reverse_proxy 127.0.0.1:8080
+}
+
+hooks.blutenstein.com {
+  encode gzip zstd
+  reverse_proxy 127.0.0.1:8080
+}
