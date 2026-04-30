@@ -95,6 +95,7 @@ def healthz():
             "line_token": bool(line_access_token()),
             "line_target": bool(line_target()),
             "line_transport": "messaging_api_push",
+            "facebook_token": bool(os.getenv("Blutenstein_FB_TOKEN") or os.getenv("FACEBOOK_ACCESS_TOKEN")),
         },
     }
 
@@ -108,7 +109,7 @@ def integrations_status():
             "shopee": "template-ready",
             "lazada": "template-ready",
             "tiktok": "template-ready",
-            "facebook": "template-ready",
+            "facebook": "configured" if os.getenv("Blutenstein_FB_TOKEN") or os.getenv("FACEBOOK_ACCESS_TOKEN") else "needs-env",
         },
         "notifications": {
             "telegram": "configured" if os.getenv("BlutensteinTelegrambot_API") else "needs-env",
