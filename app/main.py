@@ -7,7 +7,6 @@ import re
 import smtplib
 import sqlite3
 import uuid
-from collections import defaultdict
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
@@ -15,8 +14,8 @@ from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -28,22 +27,8 @@ APP_ENV = os.getenv("APP_ENV", "production")
 WAITLIST_STORE = Path(os.getenv("WAITLIST_STORE", "/data/waitlist.jsonl"))
 CUSTOMER_DB = Path(os.getenv("CUSTOMER_DB", "/data/customer_memory.sqlite3"))
 
-app = FastAPI(title="Blutenstein Portal", version="0.5.0")
+app = FastAPI(title="Blutenstein Portal", version="0.7.0")
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
-
-# Simple in-memory rate limiter (per-IP)
-_rate_store: dict[str, list[float]] = defaultdict(list)
-RATE_LIMIT_WINDOW = 60.0  # seconds
-RATE_LIMIT_MAX = 5  # max submissions per window
-
-
-def _check_rate_limit(ip: str) -> None:
-    now = datetime.now(timezone.utc).timestamp()
-    window = _rate_store[ip]
-    window[:] = [t for t in window if now - t < RATE_LIMIT_WINDOW]
-    if len(window) >= RATE_LIMIT_MAX:
-        raise HTTPException(status_code=429, detail="ส่งเร็วเกินไป กรุณารอสักครู่แล้วลองใหม่")
-    window.append(now)
 
 
 class WaitlistLead(BaseModel):
@@ -152,6 +137,7 @@ def init_customer_db() -> None:
 @app.on_event("startup")
 def startup() -> None:
     init_customer_db()
+    init_visibility_db()
 
 
 def find_customer(conn: sqlite3.Connection, contacts: dict[str, str | None]) -> str | None:
@@ -352,6 +338,325 @@ def public_channel_links() -> dict:
     }
 
 
+def cloudflare_config() -> dict:
+    """Return Cloudflare AI/edge integration status without exposing secret values."""
+    gateway_url = os.getenv("CLOUDFLARE_AI_GATEWAY_URL") or os.getenv("CF_AI_GATEWAY_URL")
+    account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID") or os.getenv("CF_ACCOUNT_ID")
+    ai_gateway_name = os.getenv("CLOUDFLARE_AI_GATEWAY_NAME") or os.getenv("CF_AI_GATEWAY_NAME")
+    vectorize_index = os.getenv("CLOUDFLARE_VECTORIZE_INDEX") or os.getenv("CF_VECTORIZE_INDEX")
+    ai_search_name = os.getenv("CLOUDFLARE_AI_SEARCH_NAME") or os.getenv("CF_AI_SEARCH_NAME")
+    r2_bucket = os.getenv("CLOUDFLARE_R2_BUCKET") or os.getenv("CF_R2_BUCKET")
+    worker_name = os.getenv("CLOUDFLARE_WORKER_NAME") or os.getenv("CF_WORKER_NAME")
+    api_token = (
+        os.getenv("CLOUDFLARE_API_TOKEN")
+        or os.getenv("CF_API_TOKEN")
+        or os.getenv("Cloudfaire_API_TOKEN")
+        or os.getenv("Cloudfaire_API")
+    )
+    return {
+        "configured": bool(gateway_url or (account_id and api_token)),
+        "account_configured": bool(account_id),
+        "api_token_configured": bool(api_token),
+        "ai_gateway": {
+            "configured": bool(gateway_url or (account_id and ai_gateway_name)),
+            "mode": "gateway-url" if gateway_url else "account-gateway-name" if account_id and ai_gateway_name else "not-configured",
+            "url_configured": bool(gateway_url),
+            "name_configured": bool(ai_gateway_name),
+            "purpose": "monitoring, caching, rate limiting, multi-provider routing, budget guardrails",
+        },
+        "workers_ai": {
+            "configured": bool(account_id and api_token),
+            "purpose": "edge inference/embeddings for lightweight visibility tasks",
+        },
+        "vectorize": {
+            "configured": bool(account_id and api_token and vectorize_index),
+            "index_configured": bool(vectorize_index),
+            "purpose": "tenant/customer semantic retrieval and RAG index",
+        },
+        "ai_search": {
+            "configured": bool(account_id and api_token and ai_search_name),
+            "instance_configured": bool(ai_search_name),
+            "purpose": "managed crawl/search layer for public and tenant knowledge",
+        },
+        "r2": {
+            "configured": bool(account_id and api_token and r2_bucket),
+            "bucket_configured": bool(r2_bucket),
+            "purpose": "customer docs/catalog/media storage",
+        },
+        "workers": {
+            "configured": bool(account_id and api_token and worker_name),
+            "worker_name_configured": bool(worker_name),
+            "purpose": "public edge SEO/AI-readable endpoints and lightweight agents",
+        },
+        "crawl_control": {
+            "configured": bool(account_id and api_token),
+            "purpose": "observe/control AI crawler access through Cloudflare zone features where available",
+        },
+    }
+
+
+def llm_config() -> dict:
+    """Return LLM config status without exposing secret values."""
+    gemini_key = (
+        os.getenv("AI_VISIBILITY_GEMINI_API_KEY")
+        or os.getenv("GEMINI_API_KEY")
+        or os.getenv("GEMINI_API")
+        or os.getenv("GEMINI_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+        or os.getenv("AI_SALES_GEMINI_API_KEY")
+    )
+    cf = cloudflare_config()
+    gateway_url = os.getenv("CLOUDFLARE_AI_GATEWAY_URL") or os.getenv("CF_AI_GATEWAY_URL")
+    model = os.getenv("AI_VISIBILITY_GEMINI_MODEL") or os.getenv("GEMINI_MODEL") or os.getenv("AI_SALES_GEMINI_MODEL", "gemini-2.5-flash-lite")
+    if gemini_key:
+        return {
+            "configured": True,
+            "provider": "gemini",
+            "model": model,
+            "gateway": "cloudflare-ai-gateway" if gateway_url else "direct-gemini",
+            "cloudflare_gateway_configured": bool(gateway_url),
+        }
+    return {"configured": False, "provider": "local-brain", "model": None, "gateway": None, "cloudflare_gateway_configured": bool(cf["ai_gateway"]["configured"])}
+
+
+VISIBILITY_TENANTS = {
+    "successcasting": {
+        "name": "Success Casting / บริษัท ซัคเซสเน็ทเวิร์ค จำกัด",
+        "domain": "successcasting.com",
+        "umbrella_url": "https://www.blutenstein.com/successcasting",
+        "brand_url": "https://www.successcasting.com/",
+        "industry": "industrial metal casting / โรงหล่อโลหะอุตสาหกรรม",
+        "service_areas": ["Thailand", "Bangkok industrial area", "Samut Prakan"],
+        "core_services": [
+            "รับหล่อโลหะครบวงจร",
+            "หล่อเหล็กหล่อ FC20/FC25/FC30",
+            "หล่อเหล็กหล่อเหนียว FCD450/FCD500/FCD600/FCD700",
+            "หล่อสแตนเลส SUS304/SUS316/SUS310/SUS420",
+            "หล่อทองเหลือง บรอนซ์ อลูมิเนียม",
+            "ผลิตชิ้นส่วนเครื่องจักรตามแบบ",
+        ],
+        "audiences": ["โรงงานอุตสาหกรรม", "ฝ่ายจัดซื้อ", "วิศวกรซ่อมบำรุง", "ผู้ประกอบการ SME"],
+        "proof_assets": ["customer memory", "AI Sales Concierge", "catalog/product sample", "LINE/Telegram contact center"],
+        "priority_intents": [
+            "โรงหล่อโลหะรับงานตามแบบ",
+            "รับหล่อเหล็ก FCD",
+            "รับหล่อสแตนเลส",
+            "หล่อชิ้นส่วนเครื่องจักร",
+            "ขอใบเสนอราคางานหล่อโลหะ",
+        ],
+    }
+}
+
+
+def init_visibility_db() -> None:
+    init_customer_db()
+    with db() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS visibility_audits (
+          id TEXT PRIMARY KEY,
+          tenant_slug TEXT NOT NULL,
+          score INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          summary_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS visibility_admin_actions (
+          id TEXT PRIMARY KEY,
+          tenant_slug TEXT NOT NULL,
+          action_type TEXT NOT NULL,
+          scope TEXT NOT NULL,
+          status TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS visibility_knowledge_assets (
+          id TEXT PRIMARY KEY,
+          tenant_slug TEXT NOT NULL,
+          asset_type TEXT NOT NULL,
+          title TEXT NOT NULL,
+          source_url TEXT,
+          content_hash TEXT NOT NULL,
+          storage_target TEXT NOT NULL,
+          index_status TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS visibility_approval_queue (
+          id TEXT PRIMARY KEY,
+          tenant_slug TEXT NOT NULL,
+          action_id TEXT NOT NULL,
+          requested_scope TEXT NOT NULL,
+          risk_level TEXT NOT NULL,
+          status TEXT NOT NULL,
+          rollback_plan TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        """)
+
+
+def visibility_score(profile: dict) -> dict:
+    checks = [
+        {"key": "business_entity", "label": "Business entity ชัดเจน", "ok": bool(profile.get("name") and profile.get("domain")), "weight": 12},
+        {"key": "service_map", "label": "Service/intent map ครบ", "ok": len(profile.get("core_services", [])) >= 5, "weight": 15},
+        {"key": "audience", "label": "กลุ่มลูกค้าเป้าหมายชัด", "ok": len(profile.get("audiences", [])) >= 3, "weight": 10},
+        {"key": "ai_summary", "label": "AI-readable business profile พร้อม", "ok": True, "weight": 12},
+        {"key": "schema", "label": "ควรมี schema.org Organization/Service/FAQ", "ok": False, "weight": 15},
+        {"key": "llms_txt", "label": "ควรมี llms.txt/AI crawler summary", "ok": False, "weight": 10},
+        {"key": "directory", "label": "ควรมี umbrella directory page", "ok": bool(profile.get("umbrella_url")), "weight": 10},
+        {"key": "customer_memory", "label": "เชื่อม customer memory/lead insight", "ok": True, "weight": 8},
+        {"key": "freshness", "label": "ควรมี freshness pipeline รายสัปดาห์", "ok": False, "weight": 8},
+    ]
+    score = sum(c["weight"] for c in checks if c["ok"])
+    missing = [c for c in checks if not c["ok"]]
+    return {"score": score, "grade": "A" if score >= 85 else "B" if score >= 70 else "C" if score >= 55 else "D", "checks": checks, "missing": missing}
+
+
+def visibility_recommendations(profile: dict) -> list[dict]:
+    slug = "successcasting"
+    services = profile.get("core_services", [])
+    intents = profile.get("priority_intents", [])
+    return [
+        {"priority": 1, "type": "schema", "title": "สร้าง Organization + LocalBusiness + Service schema", "impact": "ช่วยให้ Google/AI เข้าใจ entity และบริการหลัก", "status": "ready-to-draft"},
+        {"priority": 2, "type": "llms.txt", "title": "สร้าง llms.txt และ AI-readable profile", "impact": "ทำให้ AI crawler/agent อ่านสรุปธุรกิจได้ตรง ไม่ต้องเดา", "status": "ready-to-publish"},
+        {"priority": 3, "type": "service-pages", "title": f"สร้างหน้า service intent {min(6, len(services))} หน้าแรก", "impact": "ครอบคลุมคำค้นเชิงบริการ เช่น งานหล่อ FCD/สแตนเลส/ชิ้นส่วนเครื่องจักร", "pages": [f"/{slug}/services/{i+1}" for i, _ in enumerate(services[:6])], "status": "draft-first"},
+        {"priority": 4, "type": "faq", "title": "สร้าง FAQ จากคำถามฝ่ายขายและ quote readiness", "impact": "เพิ่มโอกาสถูกดึงเป็น answer block / AI answer", "questions": ["ต้องใช้อะไรในการขอใบเสนอราคา", "เลือกวัสดุหล่ออย่างไร", "รับผลิตขั้นต่ำเท่าไร", "ส่งแบบชิ้นงานช่องทางไหน"], "status": "draft-first"},
+        {"priority": 5, "type": "internal-ai-search", "title": "index ลูกค้าเข้า Blutenstein AI Search", "impact": "เมื่อคนถามหาบริการ ระบบแนะนำ SME ที่เหมาะได้ทันที", "queries": intents, "status": "requires-cloudflare-setup"},
+    ]
+
+
+def visibility_profile(slug: str) -> dict | None:
+    profile = VISIBILITY_TENANTS.get(slug)
+    if not profile:
+        return None
+    score = visibility_score(profile)
+    return {**profile, "slug": slug, "visibility": score, "recommendations": visibility_recommendations(profile)}
+
+
+def record_visibility_action(slug: str, action_type: str, scope: str, status: str, payload: dict) -> str:
+    init_visibility_db()
+    action_id = f"act_{uuid.uuid4().hex[:12]}"
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO visibility_admin_actions(id,tenant_slug,action_type,scope,status,payload_json,created_at) VALUES(?,?,?,?,?,?,?)",
+            (action_id, slug, action_type, scope, status, json.dumps(payload, ensure_ascii=False), now_iso()),
+        )
+    return action_id
+
+
+ADMIN_AI_SCOPES = {
+    "read_customer_data": "Read customer profile/memory summaries without exposing raw PII publicly",
+    "read_products": "Read product/service/catalog data",
+    "write_draft_content": "Create SEO/AEO/GEO drafts only",
+    "publish_pages": "Publish approved public pages",
+    "manage_dns": "Create/update DNS or edge routing records",
+    "manage_schema": "Create/update schema.org and structured data",
+    "manage_ai_search_index": "Create/update Vectorize/AI Search indexes",
+    "view_analytics": "Read search/crawler/traffic analytics",
+    "manage_r2_assets": "Store or update customer docs/catalog/media in R2",
+}
+
+ADMIN_AI_ROLES = {
+    "viewer": ["read_customer_data", "read_products", "view_analytics"],
+    "editor": ["read_customer_data", "read_products", "write_draft_content", "manage_schema", "manage_ai_search_index", "manage_r2_assets", "view_analytics"],
+    "publisher": ["read_customer_data", "read_products", "write_draft_content", "publish_pages", "manage_schema", "view_analytics"],
+    "owner": list(ADMIN_AI_SCOPES.keys()),
+}
+
+
+def create_approval_request(slug: str, action_id: str, scope: str, risk_level: str, payload: dict, rollback_plan: str) -> str:
+    init_visibility_db()
+    approval_id = f"appr_{uuid.uuid4().hex[:12]}"
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO visibility_approval_queue(id,tenant_slug,action_id,requested_scope,risk_level,status,rollback_plan,payload_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (approval_id, slug, action_id, scope, risk_level, "pending_admin_approval", rollback_plan, json.dumps(payload, ensure_ascii=False), now_iso()),
+        )
+    return approval_id
+
+
+def build_knowledge_assets(profile: dict) -> list[dict]:
+    slug = profile["slug"]
+    docs = [
+        {
+            "asset_type": "business_profile",
+            "title": f"{profile['name']} AI-readable business profile",
+            "source_url": profile.get("brand_url"),
+            "text": json.dumps({k: profile.get(k) for k in ["name", "industry", "core_services", "audiences", "priority_intents", "service_areas"]}, ensure_ascii=False),
+        },
+        {
+            "asset_type": "llms_txt",
+            "title": f"{profile['name']} llms.txt profile",
+            "source_url": f"https://www.blutenstein.com/api/visibility/customers/{slug}/llms.txt",
+            "text": "\n".join(profile.get("core_services", []) + profile.get("priority_intents", [])),
+        },
+        {
+            "asset_type": "schema_org",
+            "title": f"{profile['name']} schema.org Organization/Service graph",
+            "source_url": profile.get("umbrella_url"),
+            "text": json.dumps(service_schema(profile), ensure_ascii=False),
+        },
+    ]
+    for service in profile.get("core_services", [])[:6]:
+        docs.append({
+            "asset_type": "service_intent",
+            "title": service,
+            "source_url": profile.get("umbrella_url"),
+            "text": f"{profile['name']} provides {service}. Quote inputs: drawing/photo, material/grade, quantity, size/weight, deadline. Do not invent exact prices.",
+        })
+    assets = []
+    cf = cloudflare_config()
+    storage_targets = []
+    if cf["vectorize"]["configured"]:
+        storage_targets.append("cloudflare-vectorize")
+    if cf["ai_search"]["configured"]:
+        storage_targets.append("cloudflare-ai-search")
+    if cf["r2"]["configured"]:
+        storage_targets.append("cloudflare-r2")
+    if not storage_targets:
+        storage_targets.append("local-sqlite-staging")
+    for doc in docs:
+        content_hash = hashlib.sha256(doc["text"].encode("utf-8")).hexdigest()[:16]
+        assets.append({
+            "id": f"kasset_{content_hash}",
+            "tenant_slug": slug,
+            "asset_type": doc["asset_type"],
+            "title": doc["title"],
+            "source_url": doc.get("source_url"),
+            "content_hash": content_hash,
+            "storage_targets": storage_targets,
+            "index_status": "staged" if storage_targets == ["local-sqlite-staging"] else "ready_for_cloudflare_sync",
+            "payload": {"text_preview": doc["text"][:600], "pii_policy": "public/business-only; no raw customer PII"},
+        })
+    return assets
+
+
+def persist_knowledge_assets(slug: str, assets: list[dict]) -> None:
+    init_visibility_db()
+    with db() as conn:
+        for asset in assets:
+            for target in asset["storage_targets"]:
+                row_id = f"{asset['id']}_{hashlib.sha1(target.encode()).hexdigest()[:8]}"
+                conn.execute(
+                    """INSERT OR REPLACE INTO visibility_knowledge_assets(id,tenant_slug,asset_type,title,source_url,content_hash,storage_target,index_status,payload_json,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (row_id, slug, asset["asset_type"], asset["title"], asset.get("source_url"), asset["content_hash"], target, asset["index_status"], json.dumps(asset["payload"], ensure_ascii=False), now_iso()),
+                )
+
+
+def service_schema(profile: dict) -> dict:
+    return {
+        "@context": "https://schema.org",
+        "@type": "Organization",
+        "name": profile["name"],
+        "url": profile["brand_url"],
+        "parentOrganization": {"@type": "Organization", "name": "Blutenstein", "url": "https://www.blutenstein.com/"},
+        "areaServed": profile.get("service_areas", []),
+        "knowsAbout": profile.get("core_services", []),
+        "makesOffer": [{"@type": "Offer", "itemOffered": {"@type": "Service", "name": s}} for s in profile.get("core_services", [])],
+    }
+
+
 async def send_line(text: str) -> bool:
     token = line_access_token()
     to = line_target()
@@ -372,7 +677,7 @@ def healthz():
         "status": "ok",
         "app": "blutenstein-portal",
         "env": APP_ENV,
-        "version": "0.5.0",
+        "version": "0.7.0",
         "notifications": {
             "telegram_token": bool(os.getenv("BlutensteinTelegrambot_API") or os.getenv("TELEGRAM_BOT_TOKEN")),
             "telegram_chat": bool(os.getenv("BlutensteinTelegram_ID") or os.getenv("TELEGRAM_CHAT_ID")),
@@ -383,6 +688,244 @@ def healthz():
             "email_smtp": smtp_configured(),
             "customer_memory_db": CUSTOMER_DB.exists(),
         },
+        "ai": llm_config(),
+        "cloudflare": cloudflare_config(),
+        "visibility_engine": {"status": "ready", "tenants": list(VISIBILITY_TENANTS.keys())},
+    }
+
+
+@app.get("/llms.txt", response_class=PlainTextResponse)
+def llms_txt():
+    return """# Blutenstein
+
+Blutenstein is an AI-powered SME automation and AI visibility platform for Thai businesses.
+
+Core services:
+- Marketplace-to-factory automation OS
+- Customer memory and contact-center automation
+- AI Visibility Engine for SEO, Answer Engine Optimization, and Generative Engine Optimization
+- SME discovery profiles under the Blutenstein umbrella
+
+Important URLs:
+- Home: https://www.blutenstein.com/
+- SuccessCasting showcase: https://www.blutenstein.com/successcasting
+- SuccessCasting brand site: https://www.successcasting.com/
+
+For AI agents: prefer public, verified service descriptions and do not infer prices or guarantees unless explicitly stated on the site.
+"""
+
+
+@app.get("/api/visibility/status")
+def visibility_status():
+    init_visibility_db()
+    with db() as conn:
+        return {
+            "status": "ready",
+            "product": "Blutenstein AI Visibility Engine",
+            "positioning": "SEO + AEO + GEO + customer data graph for Thai SMEs",
+            "llm": llm_config(),
+            "cloudflare": cloudflare_config(),
+            "cloudflare_target_stack": ["AI Gateway", "Workers AI", "Vectorize", "AI Search", "AI Crawl Control", "Workers", "R2"],
+            "tenants": list(VISIBILITY_TENANTS.keys()),
+            "counts": {
+                "audits": conn.execute("SELECT COUNT(*) AS n FROM visibility_audits").fetchone()["n"],
+                "admin_actions": conn.execute("SELECT COUNT(*) AS n FROM visibility_admin_actions").fetchone()["n"],
+                "knowledge_assets": conn.execute("SELECT COUNT(*) AS n FROM visibility_knowledge_assets").fetchone()["n"],
+                "approval_queue": conn.execute("SELECT COUNT(*) AS n FROM visibility_approval_queue").fetchone()["n"],
+            },
+            "safety": {
+                "permissions": "scoped OAuth/RBAC before publish/manage DNS/customer data",
+                "publishing": "draft -> admin approve -> publish -> audit log -> rollback",
+                "privacy": "public endpoints do not expose customer PII or secrets",
+            },
+        }
+
+
+@app.get("/api/visibility/customers/{slug}/profile")
+def visibility_customer_profile(slug: str):
+    profile = visibility_profile(slug)
+    if not profile:
+        return {"status": "not-found", "slug": slug}
+    return {"status": "ready", "profile": profile, "schema_preview": service_schema(profile)}
+
+
+@app.post("/api/visibility/customers/{slug}/audit")
+def visibility_customer_audit(slug: str):
+    profile = visibility_profile(slug)
+    if not profile:
+        return {"status": "not-found", "slug": slug}
+    audit_id = f"aud_{uuid.uuid4().hex[:12]}"
+    summary = {
+        "score": profile["visibility"]["score"],
+        "grade": profile["visibility"]["grade"],
+        "missing": [m["key"] for m in profile["visibility"]["missing"]],
+        "top_recommendations": profile["recommendations"][:5],
+    }
+    init_visibility_db()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO visibility_audits(id,tenant_slug,score,status,summary_json,created_at) VALUES(?,?,?,?,?,?)",
+            (audit_id, slug, profile["visibility"]["score"], "completed", json.dumps(summary, ensure_ascii=False), now_iso()),
+        )
+    action_id = record_visibility_action(slug, "run_visibility_audit", "read_business_profile", "completed", {"audit_id": audit_id})
+    return {"status": "ok", "audit_id": audit_id, "action_id": action_id, "summary": summary}
+
+
+@app.get("/api/visibility/customers/{slug}/recommendations")
+def visibility_customer_recommendations(slug: str):
+    profile = visibility_profile(slug)
+    if not profile:
+        return {"status": "not-found", "slug": slug}
+    return {"status": "ready", "tenant": slug, "recommendations": profile["recommendations"], "llm": llm_config()}
+
+
+@app.get("/api/visibility/customers/{slug}/llms.txt", response_class=PlainTextResponse)
+def visibility_customer_llms_txt(slug: str):
+    profile = visibility_profile(slug)
+    if not profile:
+        return "# Not found\n"
+    services = "\n".join(f"- {s}" for s in profile.get("core_services", []))
+    intents = "\n".join(f"- {s}" for s in profile.get("priority_intents", []))
+    return f"""# {profile['name']}
+
+Canonical brand URL: {profile['brand_url']}
+Blutenstein umbrella URL: {profile['umbrella_url']}
+Industry: {profile['industry']}
+
+Core services:
+{services}
+
+Important search intents:
+{intents}
+
+AI agent instruction:
+Use this profile to understand the business category and route qualified inquiries to the brand website or Blutenstein customer memory/contact workflow. Do not invent exact pricing, certifications, delivery promises, or unsupported claims.
+"""
+
+
+@app.post("/api/visibility/customers/{slug}/drafts/service-pages")
+def visibility_service_page_drafts(slug: str):
+    profile = visibility_profile(slug)
+    if not profile:
+        return {"status": "not-found", "slug": slug}
+    drafts = []
+    for service in profile.get("core_services", [])[:6]:
+        path = "/" + slug + "/services/" + re.sub(r"[^a-z0-9ก-๙]+", "-", service.lower()).strip("-")
+        drafts.append({
+            "path": path,
+            "title": f"{service} | {profile['name']}",
+            "h1": service,
+            "meta_description": f"บริการ{service}สำหรับโรงงานและ SME โดย {profile['name']} พร้อมให้ทีมประเมินงานจากแบบ วัสดุ จำนวน และกำหนดส่ง",
+            "sections": ["เหมาะกับใคร", "ข้อมูลที่ต้องใช้เพื่อประเมินราคา", "วัสดุ/เกรดที่เกี่ยวข้อง", "ขั้นตอนขอใบเสนอราคา", "FAQ"],
+            "publish_status": "draft_requires_admin_approval",
+        })
+    action_id = record_visibility_action(slug, "generate_service_page_drafts", "write_draft_content", "drafted", {"draft_count": len(drafts)})
+    return {"status": "drafted", "tenant": slug, "action_id": action_id, "drafts": drafts, "approval_required": True}
+
+
+@app.get("/api/cloudflare/status")
+def cloudflare_status():
+    return {
+        "status": "ready" if cloudflare_config()["configured"] else "staged-needs-env",
+        "stack": cloudflare_config(),
+        "recommended_order": [
+            "AI Gateway in front of Gemini for observability/rate limits/cache",
+            "R2 manifest for customer docs/catalog/media",
+            "Vectorize or AI Search for tenant knowledge retrieval",
+            "Workers for edge public SEO/AI-readable endpoints",
+            "AI Crawl Control analytics/policies where available",
+        ],
+        "privacy_note": "returns boolean config only; no tokens, account ids, URLs, or secrets exposed",
+    }
+
+
+@app.get("/api/admin-ai/scopes")
+def admin_ai_scopes():
+    return {
+        "status": "ready",
+        "auth_model": "scoped OAuth/RBAC + approval queue + audit log + rollback",
+        "scopes": ADMIN_AI_SCOPES,
+        "roles": ADMIN_AI_ROLES,
+        "default_policy": "AI may draft and recommend; publish/DNS/index writes require explicit approved scope",
+    }
+
+
+@app.get("/api/admin-ai/approval-queue/status")
+def admin_ai_approval_queue_status():
+    init_visibility_db()
+    with db() as conn:
+        rows = conn.execute("SELECT status, COUNT(*) AS n FROM visibility_approval_queue GROUP BY status").fetchall()
+        return {
+            "status": "ready",
+            "counts_by_status": {row["status"]: row["n"] for row in rows},
+            "policy": "public writes stay pending until approved by an authorized admin",
+        }
+
+
+@app.get("/api/visibility/customers/{slug}/knowledge-index")
+def visibility_customer_knowledge_index(slug: str):
+    profile = visibility_profile(slug)
+    if not profile:
+        return {"status": "not-found", "slug": slug}
+    assets = build_knowledge_assets(profile)
+    return {
+        "status": "ready",
+        "tenant": slug,
+        "cloudflare": cloudflare_config(),
+        "assets_preview": assets,
+        "targets": sorted({t for a in assets for t in a["storage_targets"]}),
+        "pii_policy": "business/public data only; raw customer PII is excluded from public indexes",
+    }
+
+
+@app.post("/api/visibility/customers/{slug}/knowledge-index/build")
+def visibility_customer_knowledge_index_build(slug: str):
+    profile = visibility_profile(slug)
+    if not profile:
+        return {"status": "not-found", "slug": slug}
+    assets = build_knowledge_assets(profile)
+    persist_knowledge_assets(slug, assets)
+    action_id = record_visibility_action(slug, "build_knowledge_index_manifest", "manage_ai_search_index", "staged", {"asset_count": len(assets), "targets": sorted({t for a in assets for t in a["storage_targets"]})})
+    approval_id = create_approval_request(slug, action_id, "manage_ai_search_index", "medium", {"asset_count": len(assets)}, "Delete staged assets by action/tenant and rebuild previous manifest")
+    return {"status": "staged", "tenant": slug, "action_id": action_id, "approval_id": approval_id, "assets": len(assets), "approval_required": True, "cloudflare_sync": cloudflare_config()}
+
+
+@app.get("/api/visibility/customers/{slug}/crawl-control")
+def visibility_customer_crawl_control(slug: str):
+    profile = visibility_profile(slug)
+    if not profile:
+        return {"status": "not-found", "slug": slug}
+    return {
+        "status": "policy-ready",
+        "tenant": slug,
+        "domain": profile.get("domain"),
+        "crawl_policy": {
+            "allow_search_engines": True,
+            "allow_ai_crawlers_for_public_business_pages": True,
+            "disallow_private_customer_memory": True,
+            "monitor_with_cloudflare": cloudflare_config()["crawl_control"],
+        },
+        "recommended_public_files": ["/robots.txt", "/llms.txt", f"/api/visibility/customers/{slug}/llms.txt", "/sitemap.xml"],
+    }
+
+
+@app.get("/api/visibility/customers/{slug}/r2-manifest")
+def visibility_customer_r2_manifest(slug: str):
+    profile = visibility_profile(slug)
+    if not profile:
+        return {"status": "not-found", "slug": slug}
+    return {
+        "status": "ready" if cloudflare_config()["r2"]["configured"] else "staged-needs-r2-env",
+        "tenant": slug,
+        "bucket_configured": cloudflare_config()["r2"]["bucket_configured"],
+        "objects": [
+            {"key": f"tenants/{slug}/profiles/business-profile.json", "type": "application/json", "public": False},
+            {"key": f"tenants/{slug}/seo/llms.txt", "type": "text/plain", "public": True},
+            {"key": f"tenants/{slug}/schema/organization-service.jsonld", "type": "application/ld+json", "public": True},
+            {"key": f"tenants/{slug}/catalogs/", "type": "folder", "public": False},
+            {"key": f"tenants/{slug}/media/", "type": "folder", "public": "selective"},
+        ],
+        "privacy_note": "store raw customer files private by default; only approved public SEO assets are public",
     }
 
 
@@ -484,18 +1027,6 @@ async def line_webhook(request: Request):
 
 @app.post("/api/waitlist")
 async def waitlist(lead: WaitlistLead, request: Request):
-    # Honeypot: if website field is filled, it's a bot
-    body = await request.body()
-    try:
-        raw = json.loads(body)
-        if raw.get("website"):
-            return {"status": "ok", "message": "received"}  # silent discard
-    except Exception:
-        pass
-
-    client_ip = request.client.host if request.client else "unknown"
-    _check_rate_limit(client_ip)
-
     record = lead.model_dump()
     record.update({
         "created_at": now_iso(),
@@ -707,7 +1238,7 @@ def successcasting_html() -> str:
 <script>
 function selectSku(sku,name){{document.getElementById('sku').value=sku; location.hash='order';}}
 const f=document.getElementById('orderForm'), r=document.getElementById('result');
-f.addEventListener('submit', async e=>{{e.preventDefault(); const btn=f.querySelector('button[type="submit"]'); btn.disabled=true; btn.textContent='กำลังส่ง...'; r.textContent=''; const data=Object.fromEntries(new FormData(f).entries()); data.quantity=Number(data.quantity||1); try{{const res=await fetch('/api/successcasting/order',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(data)}}); const j=await res.json(); r.textContent=j.status==='ok'?(j.user_feedback || 'ส่งเข้าระบบแล้ว แจ้งทีมผ่าน LINE/Telegram สำเร็จ'):'ส่งไม่สำเร็จ'; if(j.status==='ok') f.reset();}}catch(err){{r.textContent='เชื่อมต่อไม่ได้ กรุณาลองใหม่';}}finally{{btn.disabled=false; btn.textContent='ส่งคำสั่งซื้อเข้าระบบ';}} }});
+f.addEventListener('submit', async e=>{{e.preventDefault(); r.textContent='กำลังส่ง...'; const data=Object.fromEntries(new FormData(f).entries()); data.quantity=Number(data.quantity||1); try{{const res=await fetch('/api/successcasting/order',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(data)}}); const j=await res.json(); r.textContent=j.status==='ok'?(j.user_feedback || 'ส่งเข้าระบบแล้ว แจ้งทีมผ่าน LINE/Telegram สำเร็จ'):'ส่งไม่สำเร็จ'; if(j.status==='ok') f.reset();}}catch(err){{r.textContent='เชื่อมต่อไม่ได้ กรุณาลองใหม่';}} }});
 </script></body></html>"""
 
 @app.get("/", response_class=HTMLResponse)
@@ -722,97 +1253,16 @@ def landing():
     return HTMLResponse(html)
 
 
-@app.get("/privacy", response_class=HTMLResponse)
-def privacy_page():
-    return HTMLResponse(PRIVACY_HTML)
-
-
-@app.get("/terms", response_class=HTMLResponse)
-def terms_page():
-    return HTMLResponse(TERMS_HTML)
-
-
-PRIVACY_HTML = """<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Privacy Policy — Blutenstein</title>
-<style>body{max-width:780px;margin:40px auto;padding:0 24px;font-family:'Source Sans 3',system-ui,sans-serif;color:#061b31;line-height:1.7}h1{font-size:32px;letter-spacing:-.03em}h2{font-size:22px;margin-top:32px}a{color:#533afd}</style></head>
-<body>
-<h1>นโยบายความเป็นส่วนตัว</h1>
-<p><em>อัปเดตล่าสุด: 1 พฤษภาคม 2026</em></p>
-
-<h2>1. ข้อมูลที่เราเก็บ</h2>
-<p>เมื่อคุณกรอกฟอร์มบนเว็บไซต์ เราเก็บข้อมูลที่คุณให้โดยตรง: ชื่อ, บริษัท, เบอร์โทร, อีเมล, LINE ID, Instagram และข้อความที่คุณส่งมา</p>
-<p>เราอาจเก็บ IP address และ user-agent จากคำขอ เพื่อป้องกันสแปมและรักษาความปลอดภัย</p>
-
-<h2>2. วิธีใช้ข้อมูล</h2>
-<ul>
-<li>ติดต่อกลับตามช่องทางที่คุณระบุ</li>
-<li>จัดการ waitlist และ demo request</li>
-<li>ส่งแจ้งเตือนภายในทีมผ่าน LINE/Telegram</li>
-<li>ปรับปรุงบริการและป้องกันการใช้งานผิดประเภท</li>
-</ul>
-
-<h2>3. การแชร์ข้อมูล</h2>
-<p>เราไม่ขายหรือแชร์ข้อมูลส่วนบุคคลให้บุคคลที่สาม ข้อมูลถูกใช้ภายในทีม Blutenstein เท่านั้น</p>
-
-<h2>4. การเก็บรักษา</h2>
-<p>ข้อมูลถูกเก็บในเซิร์ฟเวอร์ของเราและจะถูกลบเมื่อคุณร้องขอ เราเก็บข้อมูลไว้ตราบเท่าที่จำเป็นสำหรับการให้บริการ</p>
-
-<h2>5. สิทธิ์ของคุณ</h2>
-<p>คุณมีสิทธิ์เข้าถึง แก้ไข หรือขอลบข้อมูลส่วนบุคคลได้ โดยติดต่อเราผ่านช่องทางที่ระบุบนเว็บไซต์</p>
-
-<h2>6. ความปลอดภัย</h2>
-<p>เราใช้ HTTPS, environment variables สำหรับ secret ทั้งหมด และไม่เก็บ token/password ใน code repository</p>
-
-<h2>7. ติดต่อเรา</h2>
-<p>อีเมล: <a href="mailto:hello@blutenstein.com">hello@blutenstein.com</a> · LINE: <a href="https://line.me/R/ti/p/@903gggqk">@blutenstein</a></p>
-</body></html>"""
-
-
-TERMS_HTML = """<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Terms of Service — Blutenstein</title>
-<style>body{max-width:780px;margin:40px auto;padding:0 24px;font-family:'Source Sans 3',system-ui,sans-serif;color:#061b31;line-height:1.7}h1{font-size:32px;letter-spacing:-.03em}h2{font-size:22px;margin-top:32px}a{color:#533afd}</style></head>
-<body>
-<h1>ข้อกำหนดการใช้งาน</h1>
-<p><em>อัปเดตล่าสุด: 1 พฤษภาคม 2026</em></p>
-
-<h2>1. การยอมรับ</h2>
-<p>การใช้งานเว็บไซต์และบริการของ Blutenstein ถือว่าคุณยอมรับข้อกำหนดเหล่านี้</p>
-
-<h2>2. บริการ</h2>
-<p>Blutenstein ให้บริการ automation สำหรับโรงงานและ SME ไทย รวมถึงการรวมออเดอร์จาก marketplace, การจัดการสต๊อก และการแจ้งเตือนผ่าน LINE/Telegram</p>
-
-<h2>3. การใช้งานที่เหมาะสม</h2>
-<p>คุณต้องไม่ใช้บริการเพื่อวัตถุประสงค์ที่ผิดกฎหมาย หรือพยายามเข้าถึงระบบโดยไม่ได้รับอนุญาต</p>
-
-<h2>4. การปฏิเสธความรับผิด</h2>
-<p>บริการนี้ให้ "ตามสภาพ" เราไม่รับประกันว่าบริการจะไม่หยุดชะงักหรือปราศจากข้อผิดพลาด</p>
-
-<h2>5. การเปลี่ยนแปลง</h2>
-<p>เราอาจแก้ไขข้อกำหนดเป็นครั้งคราว การใช้งานต่อหลังจากมีการเปลี่ยนแปลงถือว่าคุณยอมรับข้อกำหนดใหม่</p>
-</body></html>"""
-
-
 HTML = """<!doctype html>
 <html lang="th">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Blutenstein — Marketplace-to-Factory Automation OS</title>
-  <meta name="description" content="Blutenstein คือ AI Factory Automation OS สำหรับโรงงานและ SME ไทย รวมออเดอร์ marketplace ตัดสต๊อก ทำ ledger แจ้งเตือน LINE/Telegram และเตรียม production visibility" />
-  <meta property="og:title" content="Blutenstein — AI Factory Automation OS" />
-  <meta property="og:description" content="จาก Marketplace Order สู่ Stock Ledger, Production Pulse และ Owner Brief ในระบบเดียว" />
-  <meta property="og:type" content="website" />
-  <meta property="og:url" content="https://www.blutenstein.com/" />
-  <meta property="og:image" content="https://www.blutenstein.com/static/og-image.png" />
-  <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="Blutenstein — AI Factory Automation OS" />
-  <meta name="twitter:description" content="จาก Marketplace Order สู่ Stock Ledger, Production Pulse และ Owner Brief ในระบบเดียว" />
-  <meta name="twitter:image" content="https://www.blutenstein.com/static/og-image.png" />
+  <title>Blutenstein — AI Visibility Engine + Factory Automation OS</title>
+  <meta name="description" content="Blutenstein คือ AI Visibility Engine และ Factory Automation OS สำหรับ SME ไทย ช่วยให้ธุรกิจพร้อมต่อ Google Search, AI Search, customer memory, marketplace automation และ owner dashboard" />
+  <meta property="og:title" content="Blutenstein — AI Visibility Engine for Thai SME" />
+  <meta property="og:description" content="ทำให้ธุรกิจ SME ถูกค้นพบในยุค Google AI / AI Search พร้อมระบบหลังบ้าน customer memory และ automation" />
   <meta name="theme-color" content="#061b31" />
-  <meta name="robots" content="index, follow" />
-  <link rel="canonical" href="https://www.blutenstein.com/" />
-  <link rel="icon" href="/static/favicon.ico" sizes="any" />
-  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@300;400;500;600;700&family=Source+Code+Pro:wght@400;500;700&display=swap" rel="stylesheet">
@@ -835,25 +1285,19 @@ HTML = """<!doctype html>
     .section{padding:96px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:32px;margin-bottom:30px}.section h2{font-size:clamp(34px,5vw,64px);line-height:1.08;letter-spacing:-.048em;font-weight:300;margin:0;max-width:760px}.section .sub{font-size:18px;color:var(--muted);font-weight:300;margin:0;max-width:520px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.card{background:rgba(255,255,255,.82);border:1px solid var(--border);border-radius:8px;padding:26px;box-shadow:var(--soft-shadow)}.card h3{font-size:25px;line-height:1.05;letter-spacing:-.04em;font-weight:300;margin:0 0 10px}.card p{color:var(--muted);font-weight:300;margin:0}.num{font-family:'Source Code Pro',monospace;color:var(--purple);font-size:12px;background:#f1f0ff;border:1px solid #d6d9fc;padding:5px 7px;border-radius:4px;display:inline-flex;margin-bottom:46px}.dark-band{background:radial-gradient(circle at 15% 0%,rgba(249,107,238,.22),transparent 35%),linear-gradient(180deg,#10113d,#070b20);color:#fff;margin:24px;border-radius:24px;overflow:hidden}.dark-band .sub,.dark-band .card p{color:rgba(255,255,255,.68)}.dark-band .card{background:rgba(255,255,255,.07);border-color:rgba(255,255,255,.11);box-shadow:none}.templates{display:grid;grid-template-columns:1.15fr .85fr;gap:16px}.workflow{display:grid;gap:10px}.node{display:flex;justify-content:space-between;align-items:center;padding:14px;border-radius:8px;background:rgba(255,255,255,.09);border:1px solid rgba(255,255,255,.11)}.node span{font-family:'Source Code Pro',monospace;font-size:12px;color:#c8d2ff}.terminal{background:#050813;border-radius:8px;border:1px solid rgba(255,255,255,.1);padding:18px;font-family:'Source Code Pro',monospace;font-size:12px;line-height:1.8;color:#c8d2ff;min-height:268px}.terminal b{color:#b7ffd0;font-weight:500}.terminal em{color:#ffd7ef;font-style:normal}.timeline{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.phase{position:relative;overflow:hidden}.phase:after{content:"";position:absolute;right:-35px;top:-35px;width:90px;height:90px;border-radius:50%;background:rgba(83,58,253,.08)}.phase b{color:var(--purple);font-family:'Source Code Pro',monospace;font-size:12px}.pricing{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.price{min-height:340px}.price.featured{background:linear-gradient(180deg,#11183f,#0a1029);color:#fff;transform:translateY(-10px);border-color:#11183f}.price.featured p,.price.featured li{color:rgba(255,255,255,.68)}.amount{font-size:44px;font-weight:300;letter-spacing:-.06em;margin:18px 0}.price ul{padding:0;margin:22px 0 0;list-style:none;display:grid;gap:10px}.price li{color:var(--muted);font-weight:300}.price li:before{content:"✓";color:var(--green);font-weight:700;margin-right:8px}.form-wrap{display:grid;grid-template-columns:.88fr 1.12fr;gap:18px}.form{display:grid;gap:12px}input,textarea{width:100%;border:1px solid var(--border);border-radius:8px;background:#fff;padding:15px 16px;font:inherit;color:var(--ink);outline:none;box-shadow:rgba(23,23,23,.03) 0 3px 8px}textarea{min-height:130px;resize:vertical}input:focus,textarea:focus{border-color:var(--purple);box-shadow:0 0 0 3px rgba(83,58,253,.12)}.result{min-height:22px;color:#108c3d;font-weight:600}.footer{padding:42px 0;color:var(--muted);border-top:1px solid var(--border);background:#fff}.footerin{display:flex;justify-content:space-between;gap:20px}.footer b{color:var(--ink)}
     @media(max-width:940px){.links{display:none}.mobile{display:inline-flex}.hero{grid-template-columns:1fr;padding:54px 0}.cockpit{transform:none}.section-head{display:block}.section .sub{margin-top:15px}.grid,.pricing,.timeline,.templates,.form-wrap{grid-template-columns:1fr}.price.featured{transform:none}.dark-band{margin:12px}.footerin{display:block}.screen{min-height:auto}}
     @media(max-width:560px){.wrap{padding:0 18px}.hero h1{font-size:48px}.hero-actions .btn{width:100%}.kpis{grid-template-columns:1fr}.section{padding:70px 0}.card{padding:22px}.cockpit{margin:0 -8px}.dark-band{border-radius:16px}}
-    .skip-link{position:absolute;left:-999px;top:0;z-index:999;background:var(--purple);color:#fff;padding:12px 20px;border-radius:0 0 8px 0;font-weight:600}.skip-link:focus{left:0}
-    .honeypot{position:absolute;left:-9999px;opacity:0;height:0;overflow:hidden}
-    .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
-    .btn[disabled],.btn.primary[disabled]{opacity:.6;cursor:not-allowed;transform:none}
-    .lang-toggle{display:inline-flex;align-items:center;gap:0;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:#fff;font-size:13px;font-weight:600;line-height:1;cursor:pointer;padding:0;box-shadow:rgba(23,23,23,.04) 0 2px 6px}.lang-toggle button{border:0;background:transparent;padding:7px 12px;cursor:pointer;font:inherit;color:var(--muted);transition:.15s ease}.lang-toggle button.active{background:var(--purple);color:#fff}.lang-toggle button:hover:not(.active){background:rgba(83,58,253,.06)}
   </style>
 </head>
 <body>
-  <a class="skip-link" href="#main-content" data-i18n="skip">ข้ามไปเนื้อหาหลัก</a>
-  <header class="nav" role="banner"><div class="wrap navin"><a class="brand" href="#top" aria-label="Blutenstein หน้าแรก"><span class="mark" aria-hidden="true"></span><span>Blutenstein</span></a><nav class="links" aria-label="เมนูหลัก"><a href="#platform" data-i18n="nav.platform">Platform</a><a href="#templates" data-i18n="nav.templates">Templates</a><a href="#roadmap" data-i18n="nav.roadmap">Roadmap</a><a href="#pricing" data-i18n="nav.pricing">Pricing</a><a href="#connect" data-i18n="nav.connect">Connect</a><span class="lang-toggle" role="group" aria-label="Language"><button type="button" data-lang="th" class="active" aria-label="ภาษาไทย">TH</button><button type="button" data-lang="en" aria-label="English">EN</button></span><a href="#demo" class="btn primary" data-i18n="nav.demo">ขอ Demo</a></nav><a class="mobile btn primary" href="#demo" aria-label="ขอ Demo" data-i18n="nav.demo">Demo</a></div></header>
+  <nav class="nav"><div class="wrap navin"><a class="brand" href="#top"><span class="mark"></span><span>Blutenstein</span></a><div class="links"><a href="#visibility">AI Visibility</a><a href="#platform">Platform</a><a href="#templates">Templates</a><a href="#roadmap">Roadmap</a><a href="#pricing">Pricing</a><a href="#connect" >Connect</a><a href="#demo" class="btn primary">ขอ Demo</a></div><a class="mobile btn primary" href="#demo">Demo</a></div></nav>
   <main id="top" class="wrap">
-    <section class="hero" id="main-content">
+    <section class="hero">
       <div class="orb one"></div><div class="orb two"></div>
       <div>
-        <div class="eyebrow"><span class="pulse"></span> <span data-i18n="hero.badge">Live: LINE + Telegram notifications are online</span></div>
-        <h1><span data-i18n="hero.title1">จาก marketplace chaos</span> <em data-i18n="hero.title2">สู่ factory control room</em></h1>
-        <p class="lead" data-i18n="hero.lead">Blutenstein เปลี่ยนออเดอร์จาก Shopee, Lazada, TikTok และ Facebook ให้กลายเป็น stock ledger, owner brief และ production pulse แบบอัตโนมัติ — สวยพอให้เจ้าของเปิดดูทุกวัน และนิ่งพอให้ทีมเชื่อใจ</p>
-        <div class="hero-actions"><a class="btn primary" href="#demo" data-i18n="hero.cta1">จอง Pilot Factory</a><a class="btn" href="#platform" data-i18n="hero.cta2">ดูระบบทำงาน</a><a class="btn" href="__LINE_CONNECT_URL__" target="_blank" rel="noopener">Add LINE OA</a><a class="btn" href="__TELEGRAM_CONNECT_URL__" target="_blank" rel="noopener">Start Telegram Bot</a></div>
-        <div class="proof"><span><b>Webhook verified</b> LINE Messaging API</span><span><b>HTTPS live</b> 5 hostnames</span><span><b data-i18n="hero.proof3">Mock-safe</b> <span data-i18n="hero.proof3b">ก่อนต่อ marketplace จริง</span></span></div>
+        <div class="eyebrow"><span class="pulse"></span> Live: AI Visibility Engine + customer memory are online</div>
+        <h1>ทำให้ SME ถูกค้นเจอในยุค <em>Google AI และ AI Search</em></h1>
+        <p class="lead">Blutenstein เป็น umbrella ที่ช่วยให้ธุรกิจไทยไม่ต้องกังวลเรื่อง SEO, AI Search และระบบหลังบ้าน: เราอ่านข้อมูลธุรกิจจริง สร้าง customer data graph, ทำ service pages/schema/llms.txt และต่อยอด automation จาก marketplace ถึง customer memory</p>
+        <div class="hero-actions"><a class="btn primary" href="#visibility">ดู AI Visibility Engine</a><a class="btn" href="#platform">ดูระบบหลังบ้าน</a><a class="btn" href="/api/visibility/customers/successcasting/profile">SuccessCasting AI Profile</a><a class="btn" href="__LINE_CONNECT_URL__" target="_blank" rel="noopener">Add LINE OA</a></div>
+        <div class="proof"><span><b>SEO + AEO + GEO</b> พร้อมสำหรับ AI search</span><span><b>Scoped admin AI</b> draft → approve → publish</span><span><b>Customer memory</b> เชื่อม lead data จริง</span></div>
       </div>
       <div class="cockpit" aria-label="Blutenstein factory cockpit preview">
         <div class="screen">
@@ -869,120 +1313,17 @@ HTML = """<!doctype html>
       </div>
     </section>
   </main>
-  <section id="platform" class="section" aria-label="Platform features"><div class="wrap"><div class="section-head"><h2 data-i18n="plat.title">Automation ที่เริ่มจาก pain จริง ไม่ใช่ dashboard สวยเฉย ๆ</h2><p class="sub" data-i18n="plat.sub">เราไม่ขาย ERP ก้อนใหญ่ เราขายระบบที่ทำให้เจ้าของรู้ทันทีว่า order เข้าไหม, stock ลดถูกไหม, อะไรต้องแก้ก่อนเสียเงิน</p></div><div class="grid"><div class="card"><span class="num">01 / ingest</span><h3 data-i18n="plat.c1h">รวมออเดอร์หลายช่องทาง</h3><p data-i18n="plat.c1p">รับ webhook จาก marketplace แล้ว normalize ให้ทีมเห็น order format เดียว ไม่ต้อง copy/paste ระหว่างหลังบ้าน</p></div><div class="card"><span class="num">02 / ledger</span><h3 data-i18n="plat.c2h">ตัดสต๊อกพร้อมหลักฐาน</h3><p data-i18n="plat.c2p">ทุก SKU movement ผูกกับ order_id, platform และเหตุผล ลดปัญหา stock ไม่ตรงแบบหาสาเหตุไม่ได้</p></div><div class="card"><span class="num">03 / alert</span><h3 data-i18n="plat.c3h">แจ้งเตือนแบบมนุษย์อ่านรู้เรื่อง</h3><p data-i18n="plat.c3p">LINE/Telegram แจ้งเฉพาะเรื่องที่ต้องตัดสินใจ เช่น low stock, token fail, SKU mapping missing</p></div></div></div></section>
-  <section class="dark-band"><div class="wrap section" id="templates"><div class="section-head"><h2 data-i18n="tpl.title">Template engine สำหรับโรงงานไทยที่อยากเริ่มเร็ว</h2><p class="sub" data-i18n="tpl.sub">เริ่มจาก workflow ที่ผ่าน end-to-end test แล้ว แล้ว clone เป็นระบบของลูกค้าแต่ละโรงงานได้โดยไม่สร้างใหม่จากศูนย์</p></div><div class="templates"><div class="workflow"><div class="node"><b>Marketplace Backbone</b><span>webhook → verify → normalize</span></div><div class="node"><b>Inventory Ledger</b><span>save order → deduct stock</span></div><div class="node"><b>Low Stock Ritual</b><span>velocity → reorder alert</span></div><div class="node"><b>Owner Morning Brief</b><span>sales → risk → action list</span></div></div><div class="terminal"><b>blutenstein.sync()</b><br>order.platform = <em>"shopee"</em><br>sku.delta = -4<br>ledger.reason = <em>"order_deduction"</em><br>alert.telegram = true<br>alert.line = true<br><br><b>Result:</b> one calm operating layer for owner + team</div></div></div></section>
-  <section id="roadmap" class="section"><div class="wrap"><div class="section-head"><h2 data-i18n="rm.title">Roadmap แบบ startup ที่ไม่เผาเงิน</h2><p class="sub" data-i18n="rm.sub">เริ่มจาก single-server MVP ที่ใช้งานได้จริง แล้วค่อยยกระดับเป็น multi-tenant SaaS เมื่อมี pilot และ revenue</p></div><div class="timeline"><div class="card phase"><b>MONTH 1-2</b><h3>MVP</h3><p data-i18n="rm.m1">Portal, order intake, inventory ledger, LINE/Telegram alerts, first pilot</p></div><div class="card phase"><b>MONTH 3-4</b><h3 data-i18n="rm.m2h">Paid beta</h3><p data-i18n="rm.m2">Onboarding wizard, tenant templates, AI daily summary, error inbox</p></div><div class="card phase"><b>MONTH 5-6</b><h3 data-i18n="rm.m3h">Reliability</h3><p data-i18n="rm.m3">Postgres, queue, backups, monitoring, restore drills, audit exports</p></div><div class="card phase"><b>MONTH 7-12</b><h3>Scale</h3><p data-i18n="rm.m4">Template marketplace, agency onboarding, enterprise isolation, Thai/EN switch</p></div></div></div></section>
-  <section id="pricing" class="section"><div class="wrap"><div class="section-head"><h2 data-i18n="pr.title">ราคาให้ SME ไทยกล้าลอง แต่โตไปกับระบบได้</h2><p class="sub" data-i18n="pr.sub">แพ็กเกจเริ่มจาก order + stock automation ก่อน แล้วค่อยขยายไป production ops, BOM, approval และ analytics</p></div><div class="pricing"><div class="card price"><h3>Starter</h3><p data-i18n="pr.s1d">เริ่มจัดระเบียบ order + stock</p><div class="amount">฿990–1,990</div><ul><li data-i18n="pr.s1a">1-2 sales channels</li><li data-i18n="pr.s1b">Inventory + stock ledger</li><li data-i18n="pr.s1c">Basic daily report</li><li data-i18n="pr.s1d2">LINE/Telegram alert basic</li></ul></div><div class="card price featured"><h3>Growth</h3><p data-i18n="pr.gd">สำหรับ seller/factory หลายช่องทาง</p><div class="amount">฿3,900–7,900</div><ul><li>Shopee, Lazada, TikTok, Facebook</li><li data-i18n="pr.ga">Workflow templates</li><li data-i18n="pr.gb">Low-stock + exception alerts</li><li data-i18n="pr.gc">Setup support included</li></ul></div><div class="card price"><h3>Factory Ops</h3><p data-i18n="pr.fd">สำหรับโรงงานที่ต้อง custom</p><div class="amount">฿12,000+</div><ul><li data-i18n="pr.fa">Production task board</li><li data-i18n="pr.fb">BOM/material checks</li><li data-i18n="pr.fc">Approval workflows</li><li data-i18n="pr.fd2">Custom dashboard + priority support</li></ul></div></div></div></section>
-  <section id="connect" class="section"><div class="wrap"><div class="section-head"><h2 data-i18n="con.title">Customer Connect Center</h2><p class="sub" data-i18n="con.sub">ช่องทางติดต่อจริงสำหรับเริ่มคุยกับ Blutenstein — ลูกค้ากดเพิ่ม LINE OA หรือเริ่ม Telegram bot ก่อน ระบบจึงผูกตัวตนเพื่อ automation ต่อได้</p></div><div class="grid"><a class="card" href="__LINE_CONNECT_URL__" target="_blank" rel="noopener"><span class="num">LINE</span><h3>Add LINE OA</h3><p data-i18n="con.line">เพิ่ม OA เพื่อเริ่มคุยและให้ระบบจับ source ID สำหรับงานตอบกลับอัตโนมัติในอนาคต</p></a><a class="card" href="__TELEGRAM_CONNECT_URL__" target="_blank" rel="noopener"><span class="num">Telegram</span><h3>Start Telegram Bot</h3><p data-i18n="con.tg">เริ่ม bot เพื่อเปิด chat_id สำหรับ automation</p></a><a class="card" href="__EMAIL_CONNECT_URL__"><span class="num">Email</span><h3 data-i18n="con.emh">Email confirmation</h3><p data-i18n="con.em">ส่งอีเมลยืนยัน/ขอ demo ผ่านช่องทางพื้นฐาน</p></a><a class="card" href="__INSTAGRAM_CONNECT_URL__" target="_blank" rel="noopener"><span class="num">Instagram</span><h3>Instagram DM</h3><p data-i18n="con.ig">เปิด DM สำหรับคุยรายละเอียดและนัด onboarding</p></a></div></div></section>
-  <section id="demo" class="section" aria-label="ขอ Demo"><div class="wrap form-wrap"><div class="card"><span class="eyebrow"><span class="pulse" aria-hidden="true"></span> <span data-i18n="demo.badge">Pilot slots open</span></span><h2 style="font-size:clamp(40px,5vw,64px);line-height:.96;letter-spacing:-.065em;font-weight:300;margin:24px 0 18px" data-i18n="demo.title">ให้ Blutenstein วาด workflow จริงของโรงงานคุณ</h2><p class="sub" data-i18n="demo.sub">ส่งข้อมูลมา ระบบจะบันทึกเป็น waitlist และแจ้งทีมผ่าน Telegram + LINE ทันที โดย token ทั้งหมดอ่านจาก environment variables เท่านั้น ไม่มี secret อยู่ใน code</p></div><div class="card"><form id="lead" class="form" novalidate><div class="honeypot" aria-hidden="true"><label for="hp_website">Leave blank</label><input type="text" id="hp_website" name="website" tabindex="-1" autocomplete="off"></div><label class="sr-only" for="lead-name" data-i18n="f.name">ชื่อ</label><input id="lead-name" name="name" placeholder="ชื่อ" required aria-required="true" data-i18n-ph="f.name"><label class="sr-only" for="lead-company" data-i18n="f.company">บริษัท</label><input id="lead-company" name="company" placeholder="บริษัท / ร้าน / โรงงาน" data-i18n-ph="f.company"><label class="sr-only" for="lead-phone" data-i18n="f.phone">เบอร์โทร</label><input id="lead-phone" name="phone" type="tel" placeholder="เบอร์โทร" inputmode="tel" data-i18n-ph="f.phone"><label class="sr-only" for="lead-email" data-i18n="f.email">อีเมล</label><input id="lead-email" name="email" type="email" placeholder="อีเมล" inputmode="email" data-i18n-ph="f.email"><label class="sr-only" for="lead-line">LINE ID</label><input id="lead-line" name="line_id" placeholder="LINE ID (ถ้ามี)" data-i18n-ph="f.line"><label class="sr-only" for="lead-ig">Instagram</label><input id="lead-ig" name="instagram" placeholder="Instagram (ถ้ามี)" data-i18n-ph="f.ig"><label class="sr-only" for="lead-pref" data-i18n="f.pref">ช่องทางติดต่อกลับ</label><input id="lead-pref" name="preferred_contact" placeholder="อยากให้ติดต่อกลับทางไหน เช่น email / LINE / โทร" data-i18n-ph="f.pref"><label class="sr-only" for="lead-channels" data-i18n="f.channels">ช่องทางขาย</label><input id="lead-channels" name="channels" placeholder="ขายผ่านช่องทางไหน เช่น Shopee, Lazada, TikTok" data-i18n-ph="f.channels"><label class="sr-only" for="lead-message" data-i18n="f.msg">รายละเอียด</label><textarea id="lead-message" name="message" placeholder="ปัญหาหลังบ้านที่อยากแก้ เช่น สต๊อกไม่ตรง, oversell, report ช้า" data-i18n-ph="f.msg"></textarea><button class="btn primary" type="submit" data-i18n="demo.btn">ส่งคำขอ Demo</button><div id="result" class="result" role="status" aria-live="polite"></div></form></div></div></section>
-  <footer class="footer" role="contentinfo"><div class="wrap footerin"><div><b>Blutenstein</b><br><span data-i18n="foot.desc">AI-powered factory automation OS for Thai SME factories.</span><br><small><a href="/privacy" style="color:var(--purple)" data-i18n="foot.priv">Privacy Policy</a> · <a href="/terms" style="color:var(--purple)" data-i18n="foot.terms">Terms</a></small></div><div class="mono">https://www.blutenstein.com · portal v0.5.0</div></div></footer>
+  <section id="visibility" class="section"><div class="wrap"><div class="section-head"><h2>AI Visibility Engine: ทำให้ SME ถูกเข้าใจโดย Google และ AI Search</h2><p class="sub">ระบบอ่านข้อมูลลูกค้าจริง สร้าง Business Knowledge Graph แล้วออกแบบ SEO/AEO/GEO pipeline: schema, service pages, FAQ, llms.txt, AI-readable profile และ internal Blutenstein AI Search index</p></div><div class="grid"><div class="card"><span class="num">01 / data graph</span><h3>เข้าใจธุรกิจจากข้อมูลจริง</h3><p>เชื่อม customer memory, catalog, lead history และ service map เพื่อให้ AI ไม่เขียนมั่ว และรู้ว่าลูกค้าขายอะไรจริง</p></div><div class="card"><span class="num">02 / ai seo</span><h3>SEO สำหรับยุค answer engine</h3><p>สร้าง service page, FAQ, schema.org, sitemap และ llms.txt ให้ทั้ง Google และ AI crawler อ่านง่าย</p></div><div class="card"><span class="num">03 / search guardian</span><h3>Draft → approve → publish</h3><p>AI admin ทำงานแบบ scoped permission มี audit log และต้อง approve ก่อน publish เพื่อความปลอดภัยของ SME</p></div></div><div class="hero-actions" style="margin-top:26px"><a class="btn primary" href="/api/visibility/status">Visibility API Status</a><a class="btn" href="/api/visibility/customers/successcasting/recommendations">SuccessCasting Recommendations</a><a class="btn" href="/api/visibility/customers/successcasting/llms.txt">SuccessCasting llms.txt</a></div></div></section>
+  <section id="platform" class="section"><div class="wrap"><div class="section-head"><h2>Automation ที่เริ่มจาก pain จริง ไม่ใช่ dashboard สวยเฉย ๆ</h2><p class="sub">เราไม่ขาย ERP ก้อนใหญ่ เราขายระบบที่ทำให้เจ้าของรู้ทันทีว่า order เข้าไหม, stock ลดถูกไหม, อะไรต้องแก้ก่อนเสียเงิน</p></div><div class="grid"><div class="card"><span class="num">01 / ingest</span><h3>รวมออเดอร์หลายช่องทาง</h3><p>รับ webhook จาก marketplace แล้ว normalize ให้ทีมเห็น order format เดียว ไม่ต้อง copy/paste ระหว่างหลังบ้าน</p></div><div class="card"><span class="num">02 / ledger</span><h3>ตัดสต๊อกพร้อมหลักฐาน</h3><p>ทุก SKU movement ผูกกับ order_id, platform และเหตุผล ลดปัญหา stock ไม่ตรงแบบหาสาเหตุไม่ได้</p></div><div class="card"><span class="num">03 / alert</span><h3>แจ้งเตือนแบบมนุษย์อ่านรู้เรื่อง</h3><p>LINE/Telegram แจ้งเฉพาะเรื่องที่ต้องตัดสินใจ เช่น low stock, token fail, SKU mapping missing</p></div></div></div></section>
+  <section class="dark-band"><div class="wrap section" id="templates"><div class="section-head"><h2>Template engine สำหรับโรงงานไทยที่อยากเริ่มเร็ว</h2><p class="sub">เริ่มจาก workflow ที่ผ่าน end-to-end test แล้ว แล้ว clone เป็นระบบของลูกค้าแต่ละโรงงานได้โดยไม่สร้างใหม่จากศูนย์</p></div><div class="templates"><div class="workflow"><div class="node"><b>Marketplace Backbone</b><span>webhook → verify → normalize</span></div><div class="node"><b>Inventory Ledger</b><span>save order → deduct stock</span></div><div class="node"><b>Low Stock Ritual</b><span>velocity → reorder alert</span></div><div class="node"><b>Owner Morning Brief</b><span>sales → risk → action list</span></div></div><div class="terminal"><b>blutenstein.sync()</b><br>order.platform = <em>"shopee"</em><br>sku.delta = -4<br>ledger.reason = <em>"order_deduction"</em><br>alert.telegram = true<br>alert.line = true<br><br><b>Result:</b> one calm operating layer for owner + team</div></div></div></section>
+  <section id="roadmap" class="section"><div class="wrap"><div class="section-head"><h2>Roadmap แบบ startup ที่ไม่เผาเงิน</h2><p class="sub">เริ่มจาก single-server MVP ที่ใช้งานได้จริง แล้วค่อยยกระดับเป็น multi-tenant SaaS เมื่อมี pilot และ revenue</p></div><div class="timeline"><div class="card phase"><b>MONTH 1-2</b><h3>MVP</h3><p>Portal, order intake, inventory ledger, LINE/Telegram alerts, first pilot</p></div><div class="card phase"><b>MONTH 3-4</b><h3>Paid beta</h3><p>Onboarding wizard, tenant templates, AI daily summary, error inbox</p></div><div class="card phase"><b>MONTH 5-6</b><h3>Reliability</h3><p>Postgres, queue, backups, monitoring, restore drills, audit exports</p></div><div class="card phase"><b>MONTH 7-12</b><h3>Scale</h3><p>Template marketplace, agency onboarding, enterprise isolation, Thai/EN switch</p></div></div></div></section>
+  <section id="pricing" class="section"><div class="wrap"><div class="section-head"><h2>ราคาให้ SME ไทยกล้าลอง แต่โตไปกับระบบได้</h2><p class="sub">แพ็กเกจเริ่มจาก order + stock automation ก่อน แล้วค่อยขยายไป production ops, BOM, approval และ analytics</p></div><div class="pricing"><div class="card price"><h3>Starter</h3><p>เริ่มจัดระเบียบ order + stock</p><div class="amount">฿990–1,990</div><ul><li>1-2 sales channels</li><li>Inventory + stock ledger</li><li>Basic daily report</li><li>LINE/Telegram alert basic</li></ul></div><div class="card price featured"><h3>Growth</h3><p>สำหรับ seller/factory หลายช่องทาง</p><div class="amount">฿3,900–7,900</div><ul><li>Shopee, Lazada, TikTok, Facebook</li><li>Workflow templates</li><li>Low-stock + exception alerts</li><li>Setup support included</li></ul></div><div class="card price"><h3>Factory Ops</h3><p>สำหรับโรงงานที่ต้อง custom</p><div class="amount">฿12,000+</div><ul><li>Production task board</li><li>BOM/material checks</li><li>Approval workflows</li><li>Custom dashboard + priority support</li></ul></div></div></div></section>
+  <section id="connect" class="section"><div class="wrap"><div class="section-head"><h2>Customer Connect Center</h2><p class="sub">ช่องทางติดต่อจริงสำหรับเริ่มคุยกับ Blutenstein — ลูกค้ากดเพิ่ม LINE OA หรือเริ่ม Telegram bot ก่อน ระบบจึงผูกตัวตนเพื่อ automation ต่อได้</p></div><div class="grid"><a class="card" href="__LINE_CONNECT_URL__" target="_blank" rel="noopener"><span class="num">LINE</span><h3>Add LINE OA</h3><p>เพิ่ม OA เพื่อเริ่มคุยและให้ระบบจับ source ID สำหรับงานตอบกลับอัตโนมัติในอนาคต</p></a><a class="card" href="__TELEGRAM_CONNECT_URL__" target="_blank" rel="noopener"><span class="num">Telegram</span><h3>Start Telegram Bot</h3><p>เริ่ม bot เพื่อเปิด chat_id สำหรับ automation</p></a><a class="card" href="__EMAIL_CONNECT_URL__"><span class="num">Email</span><h3>Email confirmation</h3><p>ส่งอีเมลยืนยัน/ขอ demo ผ่านช่องทางพื้นฐาน</p></a><a class="card" href="__INSTAGRAM_CONNECT_URL__" target="_blank" rel="noopener"><span class="num">Instagram</span><h3>Instagram DM</h3><p>เปิด DM สำหรับคุยรายละเอียดและนัด onboarding</p></a></div></div></section>
+  <section id="demo" class="section"><div class="wrap form-wrap"><div class="card"><span class="eyebrow"><span class="pulse"></span> Pilot slots open</span><h2 style="font-size:clamp(40px,5vw,64px);line-height:.96;letter-spacing:-.065em;font-weight:300;margin:24px 0 18px">ให้ Blutenstein วาด workflow จริงของโรงงานคุณ</h2><p class="sub">ส่งข้อมูลมา ระบบจะบันทึกเป็น waitlist และแจ้งทีมผ่าน Telegram + LINE ทันที โดย token ทั้งหมดอ่านจาก environment variables เท่านั้น ไม่มี secret อยู่ใน code</p></div><div class="card"><form id="lead" class="form"><input name="name" placeholder="ชื่อ" required><input name="company" placeholder="บริษัท / ร้าน / โรงงาน"><input name="phone" placeholder="เบอร์โทร"><input name="email" placeholder="อีเมล"><input name="line_id" placeholder="LINE ID (ถ้ามี)"><input name="instagram" placeholder="Instagram (ถ้ามี)"><input name="preferred_contact" placeholder="อยากให้ติดต่อกลับทางไหน เช่น email / LINE / โทร"><input name="channels" placeholder="ขายผ่านช่องทางไหน เช่น Shopee, Lazada, TikTok"><textarea name="message" placeholder="ปัญหาหลังบ้านที่อยากแก้ เช่น สต๊อกไม่ตรง, oversell, report ช้า"></textarea><button class="btn primary" type="submit">ส่งคำขอ Demo</button><div id="result" class="result"></div></form></div></div></section>
+  <footer class="footer"><div class="wrap footerin"><div><b>Blutenstein</b><br>AI-powered factory automation OS for Thai SME factories.</div><div class="mono">https://www.blutenstein.com · portal v0.3.0</div></div></footer>
 <script>
-(function(){
-  /* ── i18n ── */
-  var I18N={
-    th:{
-      "skip":"ข้ามไปเนื้อหาหลัก",
-      "nav.platform":"Platform","nav.templates":"Templates","nav.roadmap":"Roadmap","nav.pricing":"Pricing","nav.connect":"Connect","nav.demo":"ขอ Demo",
-      "hero.badge":"Live: LINE + Telegram notifications are online",
-      "hero.title1":"จาก marketplace chaos","hero.title2":"สู่ factory control room",
-      "hero.lead":"Blutenstein เปลี่ยนออเดอร์จาก Shopee, Lazada, TikTok และ Facebook ให้กลายเป็น stock ledger, owner brief และ production pulse แบบอัตโนมัติ — สวยพอให้เจ้าของเปิดดูทุกวัน และนิ่งพอให้ทีมเชื่อใจ",
-      "hero.cta1":"จอง Pilot Factory","hero.cta2":"ดูระบบทำงาน","hero.proof3":"Mock-safe","hero.proof3b":"ก่อนต่อ marketplace จริง",
-      "plat.title":"Automation ที่เริ่มจาก pain จริง ไม่ใช่ dashboard สวยเฉย ๆ","plat.sub":"เราไม่ขาย ERP ก้อนใหญ่ เราขายระบบที่ทำให้เจ้าของรู้ทันทีว่า order เข้าไหม, stock ลดถูกไหม, อะไรต้องแก้ก่อนเสียเงิน",
-      "plat.c1h":"รวมออเดอร์หลายช่องทาง","plat.c1p":"รับ webhook จาก marketplace แล้ว normalize ให้ทีมเห็น order format เดียว ไม่ต้อง copy/paste ระหว่างหลังบ้าน",
-      "plat.c2h":"ตัดสต๊อกพร้อมหลักฐาน","plat.c2p":"ทุก SKU movement ผูกกับ order_id, platform และเหตุผล ลดปัญหา stock ไม่ตรงแบบหาสาเหตุไม่ได้",
-      "plat.c3h":"แจ้งเตือนแบบมนุษย์อ่านรู้เรื่อง","plat.c3p":"LINE/Telegram แจ้งเฉพาะเรื่องที่ต้องตัดสินใจ เช่น low stock, token fail, SKU mapping missing",
-      "tpl.title":"Template engine สำหรับโรงงานไทยที่อยากเริ่มเร็ว","tpl.sub":"เริ่มจาก workflow ที่ผ่าน end-to-end test แล้ว แล้ว clone เป็นระบบของลูกค้าแต่ละโรงงานได้โดยไม่สร้างใหม่จากศูนย์",
-      "rm.title":"Roadmap แบบ startup ที่ไม่เผาเงิน","rm.sub":"เริ่มจาก single-server MVP ที่ใช้งานได้จริง แล้วค่อยยกระดับเป็น multi-tenant SaaS เมื่อมี pilot และ revenue",
-      "rm.m1":"Portal, order intake, inventory ledger, LINE/Telegram alerts, first pilot","rm.m2h":"Paid beta","rm.m2":"Onboarding wizard, tenant templates, AI daily summary, error inbox",
-      "rm.m3h":"Reliability","rm.m3":"Postgres, queue, backups, monitoring, restore drills, audit exports","rm.m4":"Template marketplace, agency onboarding, enterprise isolation, Thai/EN switch",
-      "pr.title":"ราคาให้ SME ไทยกล้าลอง แต่โตไปกับระบบได้","pr.sub":"แพ็กเกจเริ่มจาก order + stock automation ก่อน แล้วค่อยขยายไป production ops, BOM, approval และ analytics",
-      "pr.s1d":"เริ่มจัดระเบียบ order + stock","pr.s1a":"1-2 sales channels","pr.s1b":"Inventory + stock ledger","pr.s1c":"Basic daily report","pr.s1d2":"LINE/Telegram alert basic",
-      "pr.gd":"สำหรับ seller/factory หลายช่องทาง","pr.ga":"Workflow templates","pr.gb":"Low-stock + exception alerts","pr.gc":"Setup support included",
-      "pr.fd":"สำหรับโรงงานที่ต้อง custom","pr.fa":"Production task board","pr.fb":"BOM/material checks","pr.fc":"Approval workflows","pr.fd2":"Custom dashboard + priority support",
-      "con.title":"Customer Connect Center","con.sub":"ช่องทางติดต่อจริงสำหรับเริ่มคุยกับ Blutenstein — ลูกค้ากดเพิ่ม LINE OA หรือเริ่ม Telegram bot ก่อน ระบบจึงผูกตัวตนเพื่อ automation ต่อได้",
-      "con.line":"เพิ่ม OA เพื่อเริ่มคุยและให้ระบบจับ source ID สำหรับงานตอบกลับอัตโนมัติในอนาคต","con.tg":"เริ่ม bot เพื่อเปิด chat_id สำหรับ automation",
-      "con.emh":"Email confirmation","con.em":"ส่งอีเมลยืนยัน/ขอ demo ผ่านช่องทางพื้นฐาน","con.ig":"เปิด DM สำหรับคุยรายละเอียดและนัด onboarding",
-      "demo.badge":"Pilot slots open","demo.title":"ให้ Blutenstein วาด workflow จริงของโรงงานคุณ",
-      "demo.sub":"ส่งข้อมูลมา ระบบจะบันทึกเป็น waitlist และแจ้งทีมผ่าน Telegram + LINE ทันที โดย token ทั้งหมดอ่านจาก environment variables เท่านั้น ไม่มี secret อยู่ใน code",
-      "demo.btn":"ส่งคำขอ Demo",
-      "f.name":"ชื่อ","f.company":"บริษัท / ร้าน / โรงงาน","f.phone":"เบอร์โทร","f.email":"อีเมล","f.line":"LINE ID (ถ้ามี)","f.ig":"Instagram (ถ้ามี)",
-      "f.pref":"อยากให้ติดต่อกลับทางไหน เช่น email / LINE / โทร","f.channels":"ขายผ่านช่องทางไหน เช่น Shopee, Lazada, TikTok","f.msg":"ปัญหาหลังบ้านที่อยากแก้ เช่น สต๊อกไม่ตรง, oversell, report ช้า",
-      "foot.desc":"AI-powered factory automation OS for Thai SME factories.","foot.priv":"Privacy Policy","foot.terms":"Terms"
-    },
-    en:{
-      "skip":"Skip to main content",
-      "nav.platform":"Platform","nav.templates":"Templates","nav.roadmap":"Roadmap","nav.pricing":"Pricing","nav.connect":"Connect","nav.demo":"Get Demo",
-      "hero.badge":"Live: LINE + Telegram notifications are online",
-      "hero.title1":"From marketplace chaos","hero.title2":"to factory control room",
-      "hero.lead":"Blutenstein turns orders from Shopee, Lazada, TikTok and Facebook into stock ledger, owner brief and production pulse — automatically. Clean enough for owners to check daily, reliable enough for teams to trust.",
-      "hero.cta1":"Book Pilot Factory","hero.cta2":"See how it works","hero.proof3":"Mock-safe","hero.proof3b":"before connecting real marketplaces",
-      "plat.title":"Automation built on real pain, not just pretty dashboards","plat.sub":"We don't sell big ERP — we sell systems that let owners know instantly if orders came in, stock deducted correctly, and what needs fixing before money is lost.",
-      "plat.c1h":"Multi-channel order consolidation","plat.c1p":"Receive webhooks from marketplaces and normalize into one clean order format — no more copy/pasting between backends.",
-      "plat.c2h":"Stock ledger with proof","plat.c2p":"Every SKU movement tied to order_id, platform and reason — no more mystery stock discrepancies.",
-      "plat.c3h":"Human-readable alerts","plat.c3p":"LINE/Telegram alerts only for decisions that matter — low stock, token failures, missing SKU mappings.",
-      "tpl.title":"Template engine for Thai factories that want to start fast","tpl.sub":"Start with end-to-end tested workflows, then clone into each customer factory without rebuilding from scratch.",
-      "rm.title":"Startup roadmap without burning cash","rm.sub":"Start with a working single-server MVP, then scale to multi-tenant SaaS once you have pilots and revenue.",
-      "rm.m1":"Portal, order intake, inventory ledger, LINE/Telegram alerts, first pilot","rm.m2h":"Paid beta","rm.m2":"Onboarding wizard, tenant templates, AI daily summary, error inbox",
-      "rm.m3h":"Reliability","rm.m3":"Postgres, queue, backups, monitoring, restore drills, audit exports","rm.m4":"Template marketplace, agency onboarding, enterprise isolation, Thai/EN switch",
-      "pr.title":"Pricing that lets Thai SMEs try, but scales with the system","pr.sub":"Packages start with order + stock automation, then expand to production ops, BOM, approval and analytics.",
-      "pr.s1d":"Start organizing orders + stock","pr.s1a":"1-2 sales channels","pr.s1b":"Inventory + stock ledger","pr.s1c":"Basic daily report","pr.s1d2":"LINE/Telegram alert basic",
-      "pr.gd":"For multi-channel sellers/factories","pr.ga":"Workflow templates","pr.gb":"Low-stock + exception alerts","pr.gc":"Setup support included",
-      "pr.fd":"For factories needing custom","pr.fa":"Production task board","pr.fb":"BOM/material checks","pr.fc":"Approval workflows","pr.fd2":"Custom dashboard + priority support",
-      "con.title":"Customer Connect Center","con.sub":"Real contact channels to start talking with Blutenstein — customers add LINE OA or start Telegram bot first, then the system binds identity for automation.",
-      "con.line":"Add OA to start chatting and let the system capture source ID for future auto-replies.","con.tg":"Start the bot to open a chat_id for automation.",
-      "con.emh":"Email confirmation","con.em":"Send email confirmation or request demo via basic channel.","con.ig":"Open DM for details and onboarding scheduling.",
-      "demo.badge":"Pilot slots open","demo.title":"Let Blutenstein map your factory's real workflow",
-      "demo.sub":"Submit your info — the system saves it as a waitlist and notifies the team via Telegram + LINE immediately. All tokens are read from environment variables only — no secrets in code.",
-      "demo.btn":"Submit Demo Request",
-      "f.name":"Name","f.company":"Company / Shop / Factory","f.phone":"Phone","f.email":"Email","f.line":"LINE ID (optional)","f.ig":"Instagram (optional)",
-      "f.pref":"Preferred contact method (e.g. email / LINE / call)","f.channels":"Sales channels (e.g. Shopee, Lazada, TikTok)","f.msg":"Backend problems you want to solve (e.g. stock mismatch, oversell, slow reports)",
-      "foot.desc":"AI-powered factory automation OS for Thai SME factories.","foot.priv":"Privacy Policy","foot.terms":"Terms"
-    }
-  };
-  function setLang(lang){
-    document.documentElement.lang=lang;
-    var d=I18N[lang]||I18N.th;
-    document.querySelectorAll('[data-i18n]').forEach(function(el){
-      var k=el.getAttribute('data-i18n');
-      if(d[k]!==undefined) el.textContent=d[k];
-    });
-    document.querySelectorAll('[data-i18n-ph]').forEach(function(el){
-      var k=el.getAttribute('data-i18n-ph');
-      if(d[k]!==undefined) el.setAttribute('placeholder',d[k]);
-    });
-    document.querySelectorAll('.lang-toggle button').forEach(function(b){
-      b.classList.toggle('active',b.getAttribute('data-lang')===lang);
-    });
-    try{localStorage.setItem('blutenstein_lang',lang);}catch(e){}
-  }
-  document.querySelectorAll('.lang-toggle button').forEach(function(b){
-    b.addEventListener('click',function(){setLang(this.getAttribute('data-lang'));});
-  });
-  var saved='th';
-  try{saved=localStorage.getItem('blutenstein_lang')||'th';}catch(e){}
-  setLang(saved);
-
-  /* ── Form ── */
-  var form=document.getElementById('lead'), result=document.getElementById('result'), btn=form.querySelector('button[type="submit"]');
-  form.addEventListener('submit', async function(e){
-    e.preventDefault();
-    var hp=form.querySelector('[name="website"]');
-    if(hp && hp.value){result.textContent='ขอบคุณครับ'; return;}
-    btn.disabled=true; btn.textContent=saved==='en'?'Sending...':'กำลังส่ง...'; result.textContent='';
-    var data=Object.fromEntries(new FormData(form).entries());
-    delete data.website;
-    try{
-      var r=await fetch('/api/waitlist',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)});
-      var j=await r.json();
-      if(j.status==='ok'){result.textContent=j.user_feedback||(saved==='en'?'Sent! We will get back to you soon.':'ส่งเรียบร้อย ทีมงานจะติดต่อกลับเร็ว ๆ นี้'); form.reset();}
-      else{result.textContent=saved==='en'?'Submission failed. Please try again.':'ส่งไม่สำเร็จ กรุณาลองใหม่';}
-    }catch(err){
-      result.textContent=saved==='en'?'Connection error. Please try again.':'เชื่อมต่อไม่ได้ กรุณาลองใหม่อีกครั้ง';
-    }finally{
-      btn.disabled=false; btn.textContent=saved==='en'?'Submit Demo Request':'ส่งคำขอ Demo';
-    }
-  });
-})();
+const form=document.getElementById('lead'), result=document.getElementById('result');
+form.addEventListener('submit', async e=>{e.preventDefault(); result.textContent='กำลังส่ง...'; const data=Object.fromEntries(new FormData(form).entries()); try{const r=await fetch('/api/waitlist',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)}); const j=await r.json(); result.textContent = j.status==='ok' ? (j.user_feedback || 'ส่งเรียบร้อย ทีมงานจะติดต่อกลับเร็ว ๆ นี้') : 'ส่งไม่สำเร็จ กรุณาลองใหม่'; if(j.status==='ok') form.reset();}catch(err){result.textContent='เชื่อมต่อไม่ได้ กรุณาลองใหม่อีกครั้ง';}});
 </script>
 </body>
 </html>"""
