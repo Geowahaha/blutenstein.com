@@ -43,6 +43,18 @@ class WaitlistLead(BaseModel):
     preferred_contact: Optional[str] = Field(default=None, max_length=80)
 
 
+class BlutensteinSalesChat(BaseModel):
+    session_id: Optional[str] = Field(default=None, max_length=120)
+    visitor_id: Optional[str] = Field(default=None, max_length=120)
+    message: str = Field(min_length=1, max_length=1800)
+    name: Optional[str] = Field(default=None, max_length=120)
+    company: Optional[str] = Field(default=None, max_length=160)
+    email: Optional[str] = Field(default=None, max_length=180)
+    phone: Optional[str] = Field(default=None, max_length=80)
+    line_id: Optional[str] = Field(default=None, max_length=120)
+    preferred_contact: Optional[str] = Field(default=None, max_length=80)
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -130,6 +142,14 @@ def init_customer_db() -> None:
           error TEXT,
           created_at TEXT NOT NULL,
           FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE SET NULL
+        );
+        CREATE TABLE IF NOT EXISTS blutenstein_ai_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL,
+          role TEXT NOT NULL,
+          message TEXT NOT NULL,
+          payload_json TEXT DEFAULT '{}',
+          created_at TEXT NOT NULL
         );
         """)
 
@@ -1147,6 +1167,102 @@ def successcasting_products():
     }
 
 
+def blutenstein_secret_llm_config() -> dict:
+    gemini_key = (
+        os.getenv("AI_VISIBILITY_GEMINI_API_KEY")
+        or os.getenv("GEMINI_API_KEY")
+        or os.getenv("GEMINI_API")
+        or os.getenv("GEMINI_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+        or os.getenv("AI_SALES_GEMINI_API_KEY")
+    )
+    gateway_url = os.getenv("CLOUDFLARE_AI_GATEWAY_URL") or os.getenv("CF_AI_GATEWAY_URL")
+    model = os.getenv("AI_VISIBILITY_GEMINI_MODEL") or os.getenv("GEMINI_MODEL") or os.getenv("AI_SALES_GEMINI_MODEL", "gemini-2.5-flash-lite")
+    return {"api_key": gemini_key or "", "gateway_url": gateway_url or "", "model": model}
+
+
+def blutenstein_chat_history(session_id: str) -> list[dict]:
+    init_customer_db()
+    if not session_id:
+        return []
+    with db() as conn:
+        rows = conn.execute("SELECT role,message FROM blutenstein_ai_events WHERE session_id=? ORDER BY id DESC LIMIT 10", (session_id,)).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+def blutenstein_local_reply(message: str, history: list[dict]) -> str:
+    lower = message.lower()
+    if any(w in lower for w in ["price", "ราคา", "แพ็กเกจ", "เท่าไร"]):
+        return "Blutenstein เริ่มจาก pilot ที่วัดผลได้ก่อนครับ: Starter สำหรับ order/stock automation, Growth สำหรับหลายช่องทาง, และ Factory Ops สำหรับ workflow โรงงานเฉพาะทาง ผมขอรู้ช่องทางขายปัจจุบันและ pain หลักก่อน แล้วจะประเมินแพ็กเกจที่ไม่บวมเกินจริงให้ครับ"
+    if any(w in lower for w in ["success", "casting", "หล่อ", "โรงหล่อ"]):
+        return "SuccessCasting คือ proof case ของ Blutenstein: AI sales + RFQ memory + visibility profile + health monitoring. ถ้าคุณเป็นโรงงาน/SME แนวเดียวกัน เราสามารถ clone pattern เป็นระบบรับ lead, เก็บ customer memory, สร้าง llms.txt/schema/service pages และต่อ automation หลังบ้านได้ครับ"
+    return "Blutenstein เป็น umbrella AI operating system สำหรับ SME ไทย: AI Visibility ให้ลูกค้าถูกค้นเจอ, AI Sales ช่วยคัด lead/จำบริบท, และ Factory Automation เชื่อม order-stock-alert เป็น workflow เดียวกันครับ เล่า pain หลักของธุรกิจคุณมา 1 อย่าง เช่น สต๊อกไม่ตรง, lead หลุด, หรือไม่มีคนตอบแชท — ผมจะวิเคราะห์ next step ให้"
+
+
+async def blutenstein_llm_reply(payload: BlutensteinSalesChat, history: list[dict]) -> tuple[str, str]:
+    cfg = blutenstein_secret_llm_config()
+    if not cfg["api_key"]:
+        return blutenstein_local_reply(payload.message, history), "local-brain"
+    system = (
+        "You are Blutenstein AI Sales Architect, the umbrella AI operating system for Thai SMEs/factories. "
+        "Reply in Thai unless user uses English. Analyze the user's business pain, connect it to AI Visibility, AI Sales, customer memory, RFQ/order automation, Cloudflare AI stack, and SuccessCasting proof when relevant. "
+        "Do not give generic SaaS fluff. Be specific, strategic, and ask one high-value next question. Never expose secrets."
+    )
+    user = json.dumps({"latest_message": payload.message, "recent_history": history, "known_contact": {"name": payload.name, "company": payload.company, "email": payload.email, "phone": payload.phone, "line_id": payload.line_id}, "product": "Blutenstein AI Visibility Engine + Factory Automation OS", "proof_case": "SuccessCasting AI sales/RFQ/customer-memory/ops health"}, ensure_ascii=False)
+    body = {"model": cfg["model"], "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}], "temperature": 0.35, "max_tokens": 650}
+    urls = []
+    if cfg["gateway_url"]:
+        urls.append((cfg["gateway_url"], body))
+    direct_body = dict(body)
+    direct_body["model"] = str(cfg["model"]).split("/")[-1]
+    urls.append(("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", direct_body))
+    async with httpx.AsyncClient(timeout=18) as client:
+        last_error = None
+        for url, b in urls:
+            try:
+                r = await client.post(url, headers={"Authorization": f"Bearer {cfg['api_key']}", "Content-Type": "application/json"}, json=b)
+                if r.status_code == 429:
+                    last_error = "rate_limited"
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                answer = data.get("choices", [{}])[0].get("message", {}).get("content")
+                if answer:
+                    return answer, "llm"
+            except Exception as exc:
+                last_error = type(exc).__name__
+                continue
+    return blutenstein_local_reply(payload.message, history) + "\n\nหมายเหตุ: AI provider ชั่วคราวใช้ local brain fallback แต่ยังเก็บบริบทและ lead ได้", "local-fallback"
+
+
+@app.post("/api/ai-sales/chat")
+async def blutenstein_ai_sales_chat(payload: BlutensteinSalesChat):
+    session_id = (payload.session_id or "").strip() or "blut_" + uuid.uuid4().hex[:12]
+    history = blutenstein_chat_history(session_id)
+    answer, mode = await blutenstein_llm_reply(payload, history)
+    customer_id = ""
+    has_contact = any([payload.name, payload.email, payload.phone, payload.line_id, payload.company])
+    if has_contact:
+        mem = remember_customer(
+            source="blutenstein-ai-sales",
+            name=payload.name,
+            company=payload.company,
+            email=payload.email,
+            phone=payload.phone,
+            line_id=payload.line_id,
+            preferred_contact=payload.preferred_contact or "line",
+            subject="Blutenstein AI Sales chat",
+            body=payload.message,
+            payload={"session_id": session_id, "visitor_id": payload.visitor_id, "mode": mode},
+        )
+        customer_id = mem.get("customer_id", "")
+    init_customer_db()
+    with db() as conn:
+        conn.execute("INSERT INTO blutenstein_ai_events(session_id,role,message,payload_json,created_at) VALUES(?,?,?,?,?)", (session_id, "user", payload.message, json.dumps({"visitor_id": payload.visitor_id, "customer_id": customer_id}, ensure_ascii=False), now_iso()))
+        conn.execute("INSERT INTO blutenstein_ai_events(session_id,role,message,payload_json,created_at) VALUES(?,?,?,?,?)", (session_id, "assistant", answer, json.dumps({"mode": mode}, ensure_ascii=False), now_iso()))
+    return {"status": "ok", "session_id": session_id, "answer": answer, "mode": mode, "customer_id": customer_id}
+
+
 @app.post("/api/successcasting/order")
 async def successcasting_order(order: SuccessCastingOrder):
     product = next((p for p in SUCCESSCASTING_PRODUCTS if p["sku"] == order.sku), None)
@@ -1221,7 +1337,10 @@ def successcasting_html() -> str:
           </div>
         </article>""")
     connectors = marketplace_connector_status()
-    connector_rows = "".join(f"<div class='conn'><b>{name.title()}</b><span>{"endpoint-ready" if cfg['status'] == "needs-credentials" else cfg['status']}</span><code>{cfg['webhook']}</code></div>" for name, cfg in connectors.items())
+    connector_rows = "".join(
+        f"<div class='conn'><b>{name.title()}</b><span>{('endpoint-ready' if cfg['status'] == 'needs-credentials' else cfg['status'])}</span><code>{cfg['webhook']}</code></div>"
+        for name, cfg in connectors.items()
+    )
     products_html = "\n".join(cards)
     return f"""<!doctype html><html lang='th'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>SuccessCasting x Blutenstein — มู่เล่ย์พร้อม stock จริง</title>
@@ -1283,6 +1402,8 @@ HTML = """<!doctype html>
     .hero{position:relative;padding:78px 0 42px;display:grid;grid-template-columns:1.02fr .98fr;gap:42px;align-items:center;min-height:calc(100vh - 70px)}.hero h1{font-size:clamp(48px,7.2vw,88px);line-height:1.02;letter-spacing:-.058em;font-weight:300;margin:22px 0;color:var(--ink)}.hero h1 em{font-style:normal;color:transparent;background:linear-gradient(100deg,var(--purple),var(--ruby) 45%,#fb9b5a 78%);-webkit-background-clip:text;background-clip:text}.lead{font-size:clamp(18px,2vw,23px);line-height:1.46;color:var(--muted);max-width:700px;font-weight:300}.hero-actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:30px}.proof{display:flex;flex-wrap:wrap;gap:10px;margin-top:28px}.proof span{font-size:13px;color:var(--label);background:#fff;border:1px solid var(--border);border-radius:999px;padding:7px 10px;box-shadow:rgba(23,23,23,.04) 0 6px 18px}.proof b{color:var(--ink)}
     .orb{position:absolute;border-radius:999px;filter:blur(1px);opacity:.9}.orb.one{width:240px;height:240px;right:-90px;top:90px;background:linear-gradient(135deg,rgba(83,58,253,.24),rgba(249,107,238,.18));z-index:-1}.orb.two{width:150px;height:150px;left:-74px;bottom:90px;background:linear-gradient(135deg,rgba(37,208,255,.2),rgba(21,190,83,.14));z-index:-1}.cockpit{position:relative;background:#fff;border:1px solid var(--border);border-radius:18px;padding:12px;box-shadow:var(--shadow);transform:rotate(-1deg)}.cockpit:before{content:"";position:absolute;inset:-36px -28px auto auto;width:180px;height:180px;border-radius:50%;background:linear-gradient(135deg,var(--ruby),var(--magenta));opacity:.18;filter:blur(18px);z-index:-1}.screen{background:linear-gradient(180deg,#14184a,#0b102d);border-radius:12px;overflow:hidden;color:#fff;min-height:570px;border:1px solid rgba(255,255,255,.08)}.bar{height:46px;display:flex;align-items:center;justify-content:space-between;padding:0 16px;border-bottom:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.04)}.dots{display:flex;gap:6px}.dots i{width:10px;height:10px;border-radius:50%;background:#6570a6}.live{color:#b7ffd0;background:rgba(21,190,83,.12);border:1px solid rgba(21,190,83,.32);padding:5px 9px;border-radius:999px;font-size:12px}.dash{padding:18px}.dash h3{font-size:25px;font-weight:300;letter-spacing:-.04em;margin:0 0 14px}.kpis{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.kpi{border-radius:12px;padding:14px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.1)}.kpi small{display:block;color:#aeb7db}.kpi strong{display:block;font-size:34px;font-weight:300;letter-spacing:-.05em;margin-top:6px}.factory-line{height:154px;border-radius:14px;margin:14px 0;background:linear-gradient(180deg,rgba(83,58,253,.22),rgba(37,208,255,.08));border:1px solid rgba(255,255,255,.09);position:relative;overflow:hidden}.factory-line svg{position:absolute;inset:0;width:100%;height:100%}.pipeline{display:grid;gap:10px}.pipe{display:grid;grid-template-columns:36px 1fr auto;gap:10px;align-items:center;background:#fff;color:var(--ink);border-radius:10px;padding:11px}.pipe i{width:36px;height:36px;display:grid;place-items:center;border-radius:8px;background:#f0f3ff;color:var(--purple);font-style:normal}.pipe span{color:var(--muted);font-size:13px}.pipe b{font-weight:600}.ticker{margin-top:12px;padding:10px;border-radius:10px;background:rgba(249,107,238,.1);color:#ffd7ef;border:1px solid rgba(249,107,238,.18);font-size:13px}
     .section{padding:96px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:32px;margin-bottom:30px}.section h2{font-size:clamp(34px,5vw,64px);line-height:1.08;letter-spacing:-.048em;font-weight:300;margin:0;max-width:760px}.section .sub{font-size:18px;color:var(--muted);font-weight:300;margin:0;max-width:520px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.card{background:rgba(255,255,255,.82);border:1px solid var(--border);border-radius:8px;padding:26px;box-shadow:var(--soft-shadow)}.card h3{font-size:25px;line-height:1.05;letter-spacing:-.04em;font-weight:300;margin:0 0 10px}.card p{color:var(--muted);font-weight:300;margin:0}.num{font-family:'Source Code Pro',monospace;color:var(--purple);font-size:12px;background:#f1f0ff;border:1px solid #d6d9fc;padding:5px 7px;border-radius:4px;display:inline-flex;margin-bottom:46px}.dark-band{background:radial-gradient(circle at 15% 0%,rgba(249,107,238,.22),transparent 35%),linear-gradient(180deg,#10113d,#070b20);color:#fff;margin:24px;border-radius:24px;overflow:hidden}.dark-band .sub,.dark-band .card p{color:rgba(255,255,255,.68)}.dark-band .card{background:rgba(255,255,255,.07);border-color:rgba(255,255,255,.11);box-shadow:none}.templates{display:grid;grid-template-columns:1.15fr .85fr;gap:16px}.workflow{display:grid;gap:10px}.node{display:flex;justify-content:space-between;align-items:center;padding:14px;border-radius:8px;background:rgba(255,255,255,.09);border:1px solid rgba(255,255,255,.11)}.node span{font-family:'Source Code Pro',monospace;font-size:12px;color:#c8d2ff}.terminal{background:#050813;border-radius:8px;border:1px solid rgba(255,255,255,.1);padding:18px;font-family:'Source Code Pro',monospace;font-size:12px;line-height:1.8;color:#c8d2ff;min-height:268px}.terminal b{color:#b7ffd0;font-weight:500}.terminal em{color:#ffd7ef;font-style:normal}.timeline{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.phase{position:relative;overflow:hidden}.phase:after{content:"";position:absolute;right:-35px;top:-35px;width:90px;height:90px;border-radius:50%;background:rgba(83,58,253,.08)}.phase b{color:var(--purple);font-family:'Source Code Pro',monospace;font-size:12px}.pricing{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.price{min-height:340px}.price.featured{background:linear-gradient(180deg,#11183f,#0a1029);color:#fff;transform:translateY(-10px);border-color:#11183f}.price.featured p,.price.featured li{color:rgba(255,255,255,.68)}.amount{font-size:44px;font-weight:300;letter-spacing:-.06em;margin:18px 0}.price ul{padding:0;margin:22px 0 0;list-style:none;display:grid;gap:10px}.price li{color:var(--muted);font-weight:300}.price li:before{content:"✓";color:var(--green);font-weight:700;margin-right:8px}.form-wrap{display:grid;grid-template-columns:.88fr 1.12fr;gap:18px}.form{display:grid;gap:12px}input,textarea{width:100%;border:1px solid var(--border);border-radius:8px;background:#fff;padding:15px 16px;font:inherit;color:var(--ink);outline:none;box-shadow:rgba(23,23,23,.03) 0 3px 8px}textarea{min-height:130px;resize:vertical}input:focus,textarea:focus{border-color:var(--purple);box-shadow:0 0 0 3px rgba(83,58,253,.12)}.result{min-height:22px;color:#108c3d;font-weight:600}.footer{padding:42px 0;color:var(--muted);border-top:1px solid var(--border);background:#fff}.footerin{display:flex;justify-content:space-between;gap:20px}.footer b{color:var(--ink)}
+
+    .ai-sales{position:fixed;right:22px;bottom:22px;z-index:120;font-family:'Source Sans 3',system-ui,sans-serif;color:#061b31}.ai-sales *{box-sizing:border-box}.ai-toggle{border:1px solid rgba(83,58,253,.2);background:linear-gradient(135deg,#533afd,#ea2261);color:#fff;border-radius:999px;padding:13px 17px;font-weight:700;box-shadow:var(--shadow);cursor:pointer}.ai-panel{display:none;width:min(520px,calc(100vw - 28px));height:min(760px,calc(100vh - 44px));background:#fff;border:1px solid var(--border);border-radius:22px;overflow:hidden;box-shadow:var(--shadow)}.ai-sales.open .ai-panel{display:flex;flex-direction:column}.ai-sales.open .ai-toggle{display:none}.ai-head{height:62px;padding:0 16px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);background:linear-gradient(90deg,#fff,#f7f6ff)}.ai-head b{display:block}.ai-head small{color:var(--muted)}.ai-close{border:0;background:#fff;font-size:24px;cursor:pointer}.ai-log{flex:1;overflow:auto;padding:16px;background:radial-gradient(circle at 20% 0%,rgba(83,58,253,.09),transparent 32%),#fbfdff}.ai-msg{max-width:86%;margin:10px 0;padding:11px 13px;border-radius:16px;white-space:pre-wrap;line-height:1.42}.ai-user{margin-left:auto;background:#533afd;color:#fff;border-bottom-right-radius:4px}.ai-bot{background:#fff;border:1px solid var(--border);box-shadow:rgba(23,23,23,.05) 0 6px 18px}.ai-system{margin:auto;background:#f1f5f9;color:#475569;font-size:13px}.ai-compose{border-top:1px solid var(--border);padding:12px;background:#fff}.ai-compose textarea{width:100%;height:72px;border:1px solid var(--border);border-radius:14px;padding:11px;font:inherit;resize:none}.ai-compose button{margin-top:8px;width:100%;border:0;border-radius:12px;background:#533afd;color:white;padding:12px;font-weight:700;cursor:pointer}
     @media(max-width:940px){.links{display:none}.mobile{display:inline-flex}.hero{grid-template-columns:1fr;padding:54px 0}.cockpit{transform:none}.section-head{display:block}.section .sub{margin-top:15px}.grid,.pricing,.timeline,.templates,.form-wrap{grid-template-columns:1fr}.price.featured{transform:none}.dark-band{margin:12px}.footerin{display:block}.screen{min-height:auto}}
     @media(max-width:560px){.wrap{padding:0 18px}.hero h1{font-size:48px}.hero-actions .btn{width:100%}.kpis{grid-template-columns:1fr}.section{padding:70px 0}.card{padding:22px}.cockpit{margin:0 -8px}.dark-band{border-radius:16px}}
   </style>
@@ -1320,8 +1441,18 @@ HTML = """<!doctype html>
   <section id="pricing" class="section"><div class="wrap"><div class="section-head"><h2>ราคาให้ SME ไทยกล้าลอง แต่โตไปกับระบบได้</h2><p class="sub">แพ็กเกจเริ่มจาก order + stock automation ก่อน แล้วค่อยขยายไป production ops, BOM, approval และ analytics</p></div><div class="pricing"><div class="card price"><h3>Starter</h3><p>เริ่มจัดระเบียบ order + stock</p><div class="amount">฿990–1,990</div><ul><li>1-2 sales channels</li><li>Inventory + stock ledger</li><li>Basic daily report</li><li>LINE/Telegram alert basic</li></ul></div><div class="card price featured"><h3>Growth</h3><p>สำหรับ seller/factory หลายช่องทาง</p><div class="amount">฿3,900–7,900</div><ul><li>Shopee, Lazada, TikTok, Facebook</li><li>Workflow templates</li><li>Low-stock + exception alerts</li><li>Setup support included</li></ul></div><div class="card price"><h3>Factory Ops</h3><p>สำหรับโรงงานที่ต้อง custom</p><div class="amount">฿12,000+</div><ul><li>Production task board</li><li>BOM/material checks</li><li>Approval workflows</li><li>Custom dashboard + priority support</li></ul></div></div></div></section>
   <section id="connect" class="section"><div class="wrap"><div class="section-head"><h2>Customer Connect Center</h2><p class="sub">ช่องทางติดต่อจริงสำหรับเริ่มคุยกับ Blutenstein — ลูกค้ากดเพิ่ม LINE OA หรือเริ่ม Telegram bot ก่อน ระบบจึงผูกตัวตนเพื่อ automation ต่อได้</p></div><div class="grid"><a class="card" href="__LINE_CONNECT_URL__" target="_blank" rel="noopener"><span class="num">LINE</span><h3>Add LINE OA</h3><p>เพิ่ม OA เพื่อเริ่มคุยและให้ระบบจับ source ID สำหรับงานตอบกลับอัตโนมัติในอนาคต</p></a><a class="card" href="__TELEGRAM_CONNECT_URL__" target="_blank" rel="noopener"><span class="num">Telegram</span><h3>Start Telegram Bot</h3><p>เริ่ม bot เพื่อเปิด chat_id สำหรับ automation</p></a><a class="card" href="__EMAIL_CONNECT_URL__"><span class="num">Email</span><h3>Email confirmation</h3><p>ส่งอีเมลยืนยัน/ขอ demo ผ่านช่องทางพื้นฐาน</p></a><a class="card" href="__INSTAGRAM_CONNECT_URL__" target="_blank" rel="noopener"><span class="num">Instagram</span><h3>Instagram DM</h3><p>เปิด DM สำหรับคุยรายละเอียดและนัด onboarding</p></a></div></div></section>
   <section id="demo" class="section"><div class="wrap form-wrap"><div class="card"><span class="eyebrow"><span class="pulse"></span> Pilot slots open</span><h2 style="font-size:clamp(40px,5vw,64px);line-height:.96;letter-spacing:-.065em;font-weight:300;margin:24px 0 18px">ให้ Blutenstein วาด workflow จริงของโรงงานคุณ</h2><p class="sub">ส่งข้อมูลมา ระบบจะบันทึกเป็น waitlist และแจ้งทีมผ่าน Telegram + LINE ทันที โดย token ทั้งหมดอ่านจาก environment variables เท่านั้น ไม่มี secret อยู่ใน code</p></div><div class="card"><form id="lead" class="form"><input name="name" placeholder="ชื่อ" required><input name="company" placeholder="บริษัท / ร้าน / โรงงาน"><input name="phone" placeholder="เบอร์โทร"><input name="email" placeholder="อีเมล"><input name="line_id" placeholder="LINE ID (ถ้ามี)"><input name="instagram" placeholder="Instagram (ถ้ามี)"><input name="preferred_contact" placeholder="อยากให้ติดต่อกลับทางไหน เช่น email / LINE / โทร"><input name="channels" placeholder="ขายผ่านช่องทางไหน เช่น Shopee, Lazada, TikTok"><textarea name="message" placeholder="ปัญหาหลังบ้านที่อยากแก้ เช่น สต๊อกไม่ตรง, oversell, report ช้า"></textarea><button class="btn primary" type="submit">ส่งคำขอ Demo</button><div id="result" class="result"></div></form></div></div></section>
+
+  <div id="aiSales" class="ai-sales"><button class="ai-toggle" type="button">คุยกับ Blutenstein AI Sales</button><div class="ai-panel" role="dialog" aria-label="Blutenstein AI Sales"><div class="ai-head"><div><b>Blutenstein AI Sales</b><small>Umbrella AI OS · remembers context</small></div><button class="ai-close" type="button">×</button></div><div id="aiLog" class="ai-log"><div class="ai-msg ai-bot">สวัสดีครับ ผมคือ AI Sales Architect ของ Blutenstein เล่า pain ธุรกิจ/โรงงานของคุณมาได้เลย ผมจะวิเคราะห์ว่าควรเริ่มจาก AI Visibility, AI Sales หรือ Automation workflow ก่อน</div></div><div class="ai-compose"><textarea id="aiInput" placeholder="เช่น lead หลุดจากแชท, สต๊อกไม่ตรง, อยากให้ Google/AI search เข้าใจธุรกิจ..."></textarea><button id="aiSend" type="button">ส่งให้ AI วิเคราะห์</button></div></div></div>
   <footer class="footer"><div class="wrap footerin"><div><b>Blutenstein</b><br>AI-powered factory automation OS for Thai SME factories.</div><div class="mono">https://www.blutenstein.com · portal v0.3.0</div></div></footer>
 <script>
+
+const aiRoot=document.getElementById('aiSales'), aiLog=document.getElementById('aiLog'), aiInput=document.getElementById('aiInput'), aiSend=document.getElementById('aiSend');
+let blutSid=localStorage.getItem('blut_ai_sid')||'', blutVisitor=localStorage.getItem('blut_visitor_id')||('v_'+Math.random().toString(16).slice(2)+Date.now().toString(16)); localStorage.setItem('blut_visitor_id',blutVisitor);
+function escAi(s){return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+function addAi(role,text){const d=document.createElement('div');d.className='ai-msg '+role;d.innerHTML=escAi(text).replace(/\\n/g,'<br>');aiLog.appendChild(d);aiLog.scrollTop=aiLog.scrollHeight;return d;}
+async function askAi(){const text=aiInput.value.trim(); if(!text||aiSend.disabled)return; aiInput.value=''; addAi('ai-user',text); const t=addAi('ai-bot','กำลังวิเคราะห์ business pain + Blutenstein system context...'); aiSend.disabled=true; try{const r=await fetch('/api/ai-sales/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({session_id:blutSid,visitor_id:blutVisitor,message:text,preferred_contact:'line'})}); const j=await r.json(); t.remove(); if(j.session_id){blutSid=j.session_id;localStorage.setItem('blut_ai_sid',blutSid)} addAi('ai-bot',j.answer||'ระบบตอบไม่ได้ชั่วคราว');}catch(e){t.remove();addAi('ai-system','เชื่อมต่อ AI ไม่สำเร็จ กรุณาส่งฟอร์ม demo หรือ LINE OA');} finally{aiSend.disabled=false;aiInput.focus();}}
+if(aiRoot){aiRoot.querySelector('.ai-toggle').onclick=()=>{aiRoot.classList.add('open');setTimeout(()=>aiInput.focus(),60)};aiRoot.querySelector('.ai-close').onclick=()=>aiRoot.classList.remove('open');aiSend.onclick=askAi;aiInput.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();askAi();}});}
+
 const form=document.getElementById('lead'), result=document.getElementById('result');
 form.addEventListener('submit', async e=>{e.preventDefault(); result.textContent='กำลังส่ง...'; const data=Object.fromEntries(new FormData(form).entries()); try{const r=await fetch('/api/waitlist',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)}); const j=await r.json(); result.textContent = j.status==='ok' ? (j.user_feedback || 'ส่งเรียบร้อย ทีมงานจะติดต่อกลับเร็ว ๆ นี้') : 'ส่งไม่สำเร็จ กรุณาลองใหม่'; if(j.status==='ok') form.reset();}catch(err){result.textContent='เชื่อมต่อไม่ได้ กรุณาลองใหม่อีกครั้ง';}});
 </script>
