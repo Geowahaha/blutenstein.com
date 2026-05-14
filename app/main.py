@@ -55,6 +55,16 @@ class BlutensteinSalesChat(BaseModel):
     preferred_contact: Optional[str] = Field(default=None, max_length=80)
 
 
+class B2BLeadRunRequest(BaseModel):
+    campaign: str = Field(default="successcasting-industrial-thailand", max_length=120)
+    query: str = Field(default="โรงงานอุตสาหกรรม", max_length=180)
+    location: str = Field(default="Samut Prakan, Thailand", max_length=180)
+    radius_km: int = Field(default=35, ge=1, le=120)
+    limit: int = Field(default=25, ge=1, le=80)
+    verticals: list[str] = Field(default_factory=lambda: ["โรงงาน", "เครื่องจักร", "โลหะ", "ซ่อมบำรุง", "manufacturing", "factory", "industrial"])
+    send_mode: str = Field(default="draft", pattern="^(draft|auto)$")
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -150,6 +160,53 @@ def init_customer_db() -> None:
           message TEXT NOT NULL,
           payload_json TEXT DEFAULT '{}',
           created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS b2b_lead_runs (
+          id TEXT PRIMARY KEY,
+          campaign TEXT NOT NULL,
+          query TEXT NOT NULL,
+          location TEXT NOT NULL,
+          radius_km INTEGER NOT NULL,
+          source_mix TEXT NOT NULL,
+          status TEXT NOT NULL,
+          found_count INTEGER DEFAULT 0,
+          qualified_count INTEGER DEFAULT 0,
+          emailed_count INTEGER DEFAULT 0,
+          created_at TEXT NOT NULL,
+          payload_json TEXT DEFAULT '{}'
+        );
+        CREATE TABLE IF NOT EXISTS b2b_leads (
+          id TEXT PRIMARY KEY,
+          run_id TEXT,
+          campaign TEXT NOT NULL,
+          company TEXT NOT NULL,
+          source TEXT NOT NULL,
+          industry TEXT,
+          address TEXT,
+          phone TEXT,
+          website TEXT,
+          email TEXT,
+          linkedin_url TEXT,
+          facebook_url TEXT,
+          maps_url TEXT,
+          score INTEGER DEFAULT 0,
+          status TEXT DEFAULT 'new',
+          evidence_json TEXT DEFAULT '{}',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_b2b_leads_unique ON b2b_leads(campaign, company, website, phone);
+        CREATE TABLE IF NOT EXISTS b2b_outreach_messages (
+          id TEXT PRIMARY KEY,
+          lead_id TEXT NOT NULL,
+          channel TEXT NOT NULL,
+          subject TEXT,
+          body TEXT NOT NULL,
+          status TEXT NOT NULL,
+          sent_at TEXT,
+          error TEXT,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(lead_id) REFERENCES b2b_leads(id) ON DELETE CASCADE
         );
         """)
 
@@ -1110,6 +1167,207 @@ async def waitlist(lead: WaitlistLead, request: Request):
 
 
 
+
+def b2b_auto_send_enabled(requested_mode: str = "draft") -> bool:
+    return requested_mode == "auto" and os.getenv("B2B_OUTREACH_AUTO_SEND", "false").lower() in {"1", "true", "yes"} and smtp_configured()
+
+
+def b2b_google_places_configured() -> bool:
+    return bool(os.getenv("GOOGLE_MAPS_API_KEY") or os.getenv("GOOGLE_PLACES_API_KEY"))
+
+
+def b2b_sources_status() -> dict:
+    return {"google_maps": "official-api-ready" if b2b_google_places_configured() else "openstreetmap-fallback", "linkedin": "manual-import-or-official-api-required", "facebook": "manual-import-or-meta-api-required", "email_discovery": "website-public-contact-only", "auto_send": b2b_auto_send_enabled("auto"), "smtp_configured": smtp_configured(), "compliance": "rate-limited, business-only, opt-out-required, no credential scraping"}
+
+
+async def b2b_geocode(location: str) -> tuple[float, float]:
+    async with httpx.AsyncClient(timeout=15, headers={"User-Agent": "BlutensteinB2BLeadEngine/1.0"}) as client:
+        r = await client.get("https://nominatim.openstreetmap.org/search", params={"q": location, "format": "json", "limit": 1})
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return 13.599, 100.599
+        return float(data[0]["lat"]), float(data[0]["lon"])
+
+
+async def b2b_osm_places(query: str, location: str, radius_km: int, limit: int) -> list[dict]:
+    lat, lon = await b2b_geocode(location)
+    radius_m = max(1000, min(radius_km * 1000, 120000))
+    overpass_query = "\n".join([
+        "[out:json][timeout:25];", "(",
+        f"  node[\"name\"][\"office\"~\"company|industrial|commercial\",i](around:{radius_m},{lat},{lon});",
+        f"  way[\"name\"][\"office\"~\"company|industrial|commercial\",i](around:{radius_m},{lat},{lon});",
+        f"  node[\"name\"][\"industrial\"](around:{radius_m},{lat},{lon});",
+        f"  way[\"name\"][\"industrial\"](around:{radius_m},{lat},{lon});",
+        f"  node[\"name\"][\"man_made\"=\"works\"](around:{radius_m},{lat},{lon});",
+        f"  way[\"name\"][\"man_made\"=\"works\"](around:{radius_m},{lat},{lon});",
+        f"  node[\"name\"][\"craft\"](around:{radius_m},{lat},{lon});",
+        f"  way[\"name\"][\"craft\"](around:{radius_m},{lat},{lon});", ");", f"out center tags {limit};"
+    ])
+    elements = []
+    async with httpx.AsyncClient(timeout=18, headers={"User-Agent": "BlutensteinB2BLeadEngine/1.0"}) as client:
+        try:
+            r = await client.post("https://overpass-api.de/api/interpreter", data={"data": overpass_query})
+            if r.status_code >= 400:
+                r = await client.post("https://overpass.kumi.systems/api/interpreter", data={"data": overpass_query})
+            r.raise_for_status()
+            elements = r.json().get("elements", [])[:limit]
+        except Exception:
+            pass
+        if not elements:
+            # Overpass can be sparse/slow in Thailand. Fall back to Nominatim public place search so the daily agent never hard-fails.
+            search_terms = [
+                f"{query} {location}",
+                f"manufacturing {location}",
+                f"factory {location}",
+                f"industrial estate {location}",
+                f"นิคมอุตสาหกรรม {location}",
+            ]
+            seen = set()
+            for q in search_terms:
+                if len(elements) >= limit:
+                    break
+                try:
+                    nr = await client.get("https://nominatim.openstreetmap.org/search", params={"q": q, "format": "json", "addressdetails": 1, "limit": limit})
+                    if nr.status_code >= 400:
+                        continue
+                    for item in nr.json():
+                        key = item.get("osm_id") or item.get("display_name")
+                        if not key or key in seen:
+                            continue
+                        seen.add(key)
+                        elements.append({"id": item.get("osm_id"), "lat": item.get("lat"), "lon": item.get("lon"), "tags": {"name": item.get("name") or item.get("display_name", "").split(",")[0], "industrial": query, "addr:city": (item.get("address") or {}).get("city") or (item.get("address") or {}).get("province") or location}})
+                        if len(elements) >= limit:
+                            break
+                except Exception:
+                    continue
+    leads=[]
+    for e in elements:
+        t=e.get("tags",{}) or {}
+        name=(t.get("name") or "").strip()
+        if not name:
+            continue
+        website=t.get("website") or t.get("contact:website") or ""
+        phone=t.get("phone") or t.get("contact:phone") or ""
+        email=t.get("email") or t.get("contact:email") or ""
+        elat=e.get("lat") or (e.get("center") or {}).get("lat") or lat
+        elon=e.get("lon") or (e.get("center") or {}).get("lon") or lon
+        addr=" ".join(str(t.get(k,"")) for k in ["addr:housenumber","addr:street","addr:subdistrict","addr:city","addr:province"] if t.get(k))
+        industry=t.get("industrial") or t.get("craft") or t.get("office") or t.get("man_made") or query
+        leads.append({"company":name,"source":"openstreetmap","industry":industry,"address":addr,"phone":phone,"website":website,"email":email,"maps_url":f"https://www.google.com/maps/search/?api=1&query={elat},{elon}","evidence":{"osm_id":e.get("id"),"tags":{k:t.get(k) for k in ["industrial","craft","office","man_made","website","phone","email"] if t.get(k)}}})
+    return leads
+
+
+async def b2b_find_public_email(website: str) -> str:
+    if not website:
+        return ""
+    url = website if website.startswith(("http://", "https://")) else "https://" + website
+    candidates=[url, url.rstrip("/")+"/contact", url.rstrip("/")+"/contact-us", url.rstrip("/")+"/ติดต่อเรา"]
+    pat=re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+    async with httpx.AsyncClient(timeout=8, follow_redirects=True, headers={"User-Agent":"BlutensteinB2BLeadEngine/1.0"}) as client:
+        for u in candidates:
+            try:
+                r=await client.get(u)
+                if r.status_code >= 400 or "text/html" not in r.headers.get("content-type",""):
+                    continue
+                emails=[]
+                for m in pat.findall(r.text[:250000]):
+                    em=m.lower().strip(".,;:)")
+                    if any(bad in em for bad in ["example.com","domain.com","your@email","sentry.io"]):
+                        continue
+                    emails.append(em)
+                if emails:
+                    preferred=sorted(set(emails), key=lambda x: (not any(k in x for k in ["sales","info","contact","hello"]), len(x)))
+                    return preferred[0]
+            except Exception:
+                continue
+    return ""
+
+
+def b2b_score_lead(lead: dict, verticals: list[str]) -> tuple[int, list[str]]:
+    text=" ".join(str(lead.get(k, "")) for k in ["company","industry","address","website","email","phone"]).lower()
+    reasons=[]; score=20
+    for v in verticals:
+        if v and v.lower() in text:
+            score += 18; reasons.append(f"matched:{v}")
+    if lead.get("website"):
+        score += 15; reasons.append("has_website")
+    if lead.get("email"):
+        score += 25; reasons.append("has_email")
+    if lead.get("phone"):
+        score += 10; reasons.append("has_phone")
+    if any(w in text for w in ["factory","industrial","โรงงาน","เครื่องจักร","manufacturing","metal","โลหะ","mold","automation"]):
+        score += 20; reasons.append("industrial_signal")
+    return min(score,100), reasons
+
+
+async def b2b_outreach_copy(lead: dict, campaign: str) -> tuple[str, str]:
+    cfg = blutenstein_secret_llm_config() if "blutenstein_secret_llm_config" in globals() else {"api_key":"","gateway_url":"","model":"gemini-2.5-flash-lite"}
+    company=lead.get("company") or "ทีมงาน"
+    context=json.dumps({"company":company,"industry":lead.get("industry"),"website":lead.get("website"),"campaign":campaign,"product":"Blutenstein AI B2B Lead Engine + AI Visibility + AI Sales + Factory Automation OS","proof":"SuccessCasting AI sales/RFQ/customer-memory/ops health"},ensure_ascii=False)
+    fallback_subject=f"ช่วยให้ {company} ไม่พลาด lead และถูกค้นเจอมากขึ้น"
+    fallback_body=f"สวัสดีครับทีม {company}\n\nผมจาก Blutenstein เห็นว่าธุรกิจของคุณอยู่ในกลุ่ม B2B/อุตสาหกรรมที่ lead จากเว็บ แชท และ Google มักหลุดง่าย เราช่วยทำ AI Visibility + AI Sales Memory ให้ลูกค้าหาเจอ ตอบแชทได้ต่อเนื่อง และเก็บ lead/RFQ เป็นระบบเดียวกันได้ครับ\n\nถ้าสะดวก ผมอยากขอเวลา 15 นาทีเพื่อดูว่า lead ปัจจุบันหลุดตรงไหน และทำ quick win ให้เห็นภายใน 7 วันได้หรือไม่\n\nถ้าไม่เกี่ยวข้อง สามารถตอบกลับว่าไม่สนใจได้เลยครับ"
+    if not cfg.get("api_key"):
+        return fallback_subject, fallback_body
+    system="Write concise Thai B2B cold outreach. Personalize from evidence. No fake claims, no pressure, include opt-out line. Return JSON with subject and body."
+    body={"model":cfg.get("model") or "gemini-2.5-flash-lite","messages":[{"role":"system","content":system},{"role":"user","content":context}],"temperature":0.35,"max_tokens":500}
+    urls=[]
+    if cfg.get("gateway_url"):
+        urls.append((cfg["gateway_url"], body))
+    direct=dict(body); direct["model"]=str(direct["model"]).split("/")[-1]
+    urls.append(("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", direct))
+    async with httpx.AsyncClient(timeout=18) as client:
+        for url,b in urls:
+            try:
+                r=await client.post(url,headers={"Authorization":f"Bearer {cfg['api_key']}","Content-Type":"application/json"},json=b)
+                if r.status_code>=400: continue
+                txt=r.json().get("choices",[{}])[0].get("message",{}).get("content","")
+                m=re.search(r"\{.*\}", txt, re.S)
+                if m:
+                    j=json.loads(m.group(0))
+                    return str(j.get("subject") or fallback_subject)[:180], str(j.get("body") or fallback_body)[:4000]
+                if txt:
+                    return fallback_subject, txt[:4000]
+            except Exception:
+                continue
+    return fallback_subject, fallback_body
+
+
+async def b2b_send_outreach(email: str, subject: str, body: str) -> tuple[str, str | None]:
+    if not normalize_email(email):
+        return "draft_no_email", None
+    if not b2b_auto_send_enabled("auto"):
+        return "draft", None
+    ok = await send_email_feedback(email, subject, body, None)
+    return ("sent" if ok else "failed"), (None if ok else "smtp_send_failed")
+
+
+async def run_b2b_lead_engine(req: B2BLeadRunRequest) -> dict:
+    init_customer_db(); run_id="b2brun_"+uuid.uuid4().hex[:12]; source_status=b2b_sources_status()
+    with db() as conn:
+        conn.execute("INSERT INTO b2b_lead_runs(id,campaign,query,location,radius_km,source_mix,status,created_at,payload_json) VALUES(?,?,?,?,?,?,?,?,?)", (run_id, req.campaign, req.query, req.location, req.radius_km, json.dumps(source_status,ensure_ascii=False), "running", now_iso(), json.dumps(req.model_dump(),ensure_ascii=False)))
+    raw=await b2b_osm_places(req.query, req.location, req.radius_km, req.limit)
+    qualified=[]; emailed=0
+    for lead in raw:
+        if not lead.get("email") and lead.get("website"):
+            lead["email"] = await b2b_find_public_email(lead["website"])
+        score,reasons=b2b_score_lead(lead, req.verticals); lead["score"]=score; lead["evidence"]={**(lead.get("evidence") or {}),"score_reasons":reasons,"sources_status":source_status}
+        if score < int(os.getenv("B2B_LEAD_MIN_SCORE", "45")):
+            continue
+        lead_id="b2blead_"+hashlib.sha1((req.campaign+lead.get("company","")+lead.get("website","")+lead.get("phone","")).encode()).hexdigest()[:16]
+        subject,body=await b2b_outreach_copy(lead, req.campaign)
+        status,error=await b2b_send_outreach(lead.get("email",""), subject, body) if req.send_mode=="auto" else ("draft", None)
+        if status=="sent": emailed+=1
+        with db() as conn:
+            conn.execute("""INSERT OR IGNORE INTO b2b_leads(id,run_id,campaign,company,source,industry,address,phone,website,email,linkedin_url,facebook_url,maps_url,score,status,evidence_json,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (lead_id,run_id,req.campaign,lead.get("company",""),lead.get("source","openstreetmap"),lead.get("industry",""),lead.get("address",""),lead.get("phone",""),lead.get("website",""),lead.get("email",""),lead.get("linkedin_url",""),lead.get("facebook_url",""),lead.get("maps_url",""),score,"qualified",json.dumps(lead.get("evidence",{}),ensure_ascii=False),now_iso(),now_iso()))
+            conn.execute("INSERT INTO b2b_outreach_messages(id,lead_id,channel,subject,body,status,sent_at,error,created_at) VALUES(?,?,?,?,?,?,?,?,?)", ("b2bout_"+uuid.uuid4().hex[:12], lead_id, "email", subject, body, status, now_iso() if status=="sent" else None, error, now_iso()))
+        qualified.append({"id":lead_id,"company":lead.get("company"),"score":score,"email_found":bool(lead.get("email")),"status":status,"source":lead.get("source"),"maps_url":lead.get("maps_url"),"website":lead.get("website")})
+    with db() as conn:
+        conn.execute("UPDATE b2b_lead_runs SET status=?, found_count=?, qualified_count=?, emailed_count=?, payload_json=? WHERE id=?", ("ok", len(raw), len(qualified), emailed, json.dumps({"request":req.model_dump(),"source_status":source_status},ensure_ascii=False), run_id))
+    return {"status":"ok","run_id":run_id,"found":len(raw),"qualified":len(qualified),"emailed":emailed,"mode":"auto-send" if b2b_auto_send_enabled(req.send_mode) else "draft/queue","source_status":source_status,"leads":qualified[:20]}
+
+
 class SuccessCastingOrder(BaseModel):
     sku: str = Field(min_length=1, max_length=80)
     quantity: int = Field(default=1, ge=1, le=100)
@@ -1360,6 +1618,31 @@ const f=document.getElementById('orderForm'), r=document.getElementById('result'
 f.addEventListener('submit', async e=>{{e.preventDefault(); r.textContent='กำลังส่ง...'; const data=Object.fromEntries(new FormData(f).entries()); data.quantity=Number(data.quantity||1); try{{const res=await fetch('/api/successcasting/order',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(data)}}); const j=await res.json(); r.textContent=j.status==='ok'?(j.user_feedback || 'ส่งเข้าระบบแล้ว แจ้งทีมผ่าน LINE/Telegram สำเร็จ'):'ส่งไม่สำเร็จ'; if(j.status==='ok') f.reset();}}catch(err){{r.textContent='เชื่อมต่อไม่ได้ กรุณาลองใหม่';}} }});
 </script></body></html>"""
 
+@app.get("/api/b2b/status")
+def b2b_status():
+    init_customer_db()
+    with db() as conn:
+        total = conn.execute("SELECT COUNT(*) AS n FROM b2b_leads").fetchone()["n"]
+        qualified = conn.execute("SELECT COUNT(*) AS n FROM b2b_leads WHERE status='qualified'").fetchone()["n"]
+        drafts = conn.execute("SELECT COUNT(*) AS n FROM b2b_outreach_messages WHERE status LIKE 'draft%'").fetchone()["n"]
+        sent = conn.execute("SELECT COUNT(*) AS n FROM b2b_outreach_messages WHERE status='sent'").fetchone()["n"]
+        last = conn.execute("SELECT * FROM b2b_lead_runs ORDER BY created_at DESC LIMIT 1").fetchone()
+    return {"status":"ok","sources":b2b_sources_status(),"counts":{"leads_total":total,"qualified":qualified,"drafts":drafts,"sent":sent},"last_run":dict(last) if last else None}
+
+
+@app.get("/api/b2b/leads")
+def b2b_leads(limit: int = 25):
+    init_customer_db()
+    with db() as conn:
+        rows = conn.execute("SELECT id,company,source,industry,address,phone,website,email,score,status,maps_url,created_at FROM b2b_leads ORDER BY created_at DESC LIMIT ?", (min(max(limit,1),100),)).fetchall()
+    return {"status":"ok","leads":[dict(r) for r in rows]}
+
+
+@app.post("/api/b2b/run")
+async def b2b_run(req: B2BLeadRunRequest):
+    return await run_b2b_lead_engine(req)
+
+
 @app.get("/", response_class=HTMLResponse)
 def landing():
     links = public_channel_links()
@@ -1409,7 +1692,7 @@ HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <nav class="nav"><div class="wrap navin"><a class="brand" href="#top"><span class="mark"></span><span>Blutenstein</span></a><div class="links"><a href="#visibility">AI Visibility</a><a href="#platform">Platform</a><a href="#templates">Templates</a><a href="#roadmap">Roadmap</a><a href="#pricing">Pricing</a><a href="#connect" >Connect</a><a href="#demo" class="btn primary">ขอ Demo</a></div><a class="mobile btn primary" href="#demo">Demo</a></div></nav>
+  <nav class="nav"><div class="wrap navin"><a class="brand" href="#top"><span class="mark"></span><span>Blutenstein</span></a><div class="links"><a href="#visibility">AI Visibility</a><a href="#platform">Platform</a><a href="#b2b-leads">B2B Leads</a><a href="#templates">Templates</a><a href="#roadmap">Roadmap</a><a href="#pricing">Pricing</a><a href="#connect" >Connect</a><a href="#demo" class="btn primary">ขอ Demo</a></div><a class="mobile btn primary" href="#demo">Demo</a></div></nav>
   <main id="top" class="wrap">
     <section class="hero">
       <div class="orb one"></div><div class="orb two"></div>
@@ -1436,6 +1719,8 @@ HTML = """<!doctype html>
   </main>
   <section id="visibility" class="section"><div class="wrap"><div class="section-head"><h2>AI Visibility Engine: ทำให้ SME ถูกเข้าใจโดย Google และ AI Search</h2><p class="sub">ระบบอ่านข้อมูลลูกค้าจริง สร้าง Business Knowledge Graph แล้วออกแบบ SEO/AEO/GEO pipeline: schema, service pages, FAQ, llms.txt, AI-readable profile และ internal Blutenstein AI Search index</p></div><div class="grid"><div class="card"><span class="num">01 / data graph</span><h3>เข้าใจธุรกิจจากข้อมูลจริง</h3><p>เชื่อม customer memory, catalog, lead history และ service map เพื่อให้ AI ไม่เขียนมั่ว และรู้ว่าลูกค้าขายอะไรจริง</p></div><div class="card"><span class="num">02 / ai seo</span><h3>SEO สำหรับยุค answer engine</h3><p>สร้าง service page, FAQ, schema.org, sitemap และ llms.txt ให้ทั้ง Google และ AI crawler อ่านง่าย</p></div><div class="card"><span class="num">03 / search guardian</span><h3>Draft → approve → publish</h3><p>AI admin ทำงานแบบ scoped permission มี audit log และต้อง approve ก่อน publish เพื่อความปลอดภัยของ SME</p></div></div><div class="hero-actions" style="margin-top:26px"><a class="btn primary" href="/api/visibility/status">Visibility API Status</a><a class="btn" href="/api/visibility/customers/successcasting/recommendations">SuccessCasting Recommendations</a><a class="btn" href="/api/visibility/customers/successcasting/llms.txt">SuccessCasting llms.txt</a></div></div></section>
   <section id="platform" class="section"><div class="wrap"><div class="section-head"><h2>Automation ที่เริ่มจาก pain จริง ไม่ใช่ dashboard สวยเฉย ๆ</h2><p class="sub">เราไม่ขาย ERP ก้อนใหญ่ เราขายระบบที่ทำให้เจ้าของรู้ทันทีว่า order เข้าไหม, stock ลดถูกไหม, อะไรต้องแก้ก่อนเสียเงิน</p></div><div class="grid"><div class="card"><span class="num">01 / ingest</span><h3>รวมออเดอร์หลายช่องทาง</h3><p>รับ webhook จาก marketplace แล้ว normalize ให้ทีมเห็น order format เดียว ไม่ต้อง copy/paste ระหว่างหลังบ้าน</p></div><div class="card"><span class="num">02 / ledger</span><h3>ตัดสต๊อกพร้อมหลักฐาน</h3><p>ทุก SKU movement ผูกกับ order_id, platform และเหตุผล ลดปัญหา stock ไม่ตรงแบบหาสาเหตุไม่ได้</p></div><div class="card"><span class="num">03 / alert</span><h3>แจ้งเตือนแบบมนุษย์อ่านรู้เรื่อง</h3><p>LINE/Telegram แจ้งเฉพาะเรื่องที่ต้องตัดสินใจ เช่น low stock, token fail, SKU mapping missing</p></div></div></div></section>
+
+  <section id="b2b-leads" class="section"><div class="wrap"><div class="section-head"><span class="kicker">B2B Lead Engine</span><h2>ระบบหาลูกค้า B2B อัตโนมัติ เหมือนมีทีมเซลล์ทำงานทุกวัน</h2><p class="sub">Blutenstein ค้นหา lead ธุรกิจจากแผนที่/แหล่งข้อมูลสาธารณะ, คัดเฉพาะกลุ่มที่ตรง ICP, หา public contact email จากเว็บไซต์, ให้ AI เขียน outreach เฉพาะราย และ queue ส่งแบบปลอดภัย เมื่อ SMTP + auto-send flag พร้อมจึงส่งอัตโนมัติ</p></div><div class="grid"><div class="card"><span class="num">01 / find</span><h3>Lead discovery</h3><p>ค้นหาโรงงาน/SME/B2B ในพื้นที่เป้าหมายผ่าน Google Maps-ready link และ OpenStreetMap fallback โดยไม่ scrape credential-gated Facebook/LinkedIn</p></div><div class="card"><span class="num">02 / qualify</span><h3>ICP scoring</h3><p>ให้คะแนน lead จาก industry signal, website, phone, email, location และ keyword match เพื่อไม่ยิงมั่ว</p></div><div class="card"><span class="num">03 / write</span><h3>Personalized outreach</h3><p>AI เขียนอีเมลเฉพาะบริษัท อ้าง pain จริง: lead หลุด, Google/AI Search หาไม่เจอ, customer memory, RFQ/order automation</p></div><div class="card"><span class="num">04 / send</span><h3>Daily sales queue</h3><p>โหมดเริ่มต้นเป็น draft/queue เพื่อกัน spam; เปิด auto-send ได้เมื่อ SMTP, opt-out, limit และ policy พร้อม</p></div></div><div class="panel"><h3>Live API</h3><p class="sub"><code>POST /api/b2b/run</code> · <code>GET /api/b2b/status</code> · <code>GET /api/b2b/leads</code></p></div></div></section>
   <section class="dark-band"><div class="wrap section" id="templates"><div class="section-head"><h2>Template engine สำหรับโรงงานไทยที่อยากเริ่มเร็ว</h2><p class="sub">เริ่มจาก workflow ที่ผ่าน end-to-end test แล้ว แล้ว clone เป็นระบบของลูกค้าแต่ละโรงงานได้โดยไม่สร้างใหม่จากศูนย์</p></div><div class="templates"><div class="workflow"><div class="node"><b>Marketplace Backbone</b><span>webhook → verify → normalize</span></div><div class="node"><b>Inventory Ledger</b><span>save order → deduct stock</span></div><div class="node"><b>Low Stock Ritual</b><span>velocity → reorder alert</span></div><div class="node"><b>Owner Morning Brief</b><span>sales → risk → action list</span></div></div><div class="terminal"><b>blutenstein.sync()</b><br>order.platform = <em>"shopee"</em><br>sku.delta = -4<br>ledger.reason = <em>"order_deduction"</em><br>alert.telegram = true<br>alert.line = true<br><br><b>Result:</b> one calm operating layer for owner + team</div></div></div></section>
   <section id="roadmap" class="section"><div class="wrap"><div class="section-head"><h2>Roadmap แบบ startup ที่ไม่เผาเงิน</h2><p class="sub">เริ่มจาก single-server MVP ที่ใช้งานได้จริง แล้วค่อยยกระดับเป็น multi-tenant SaaS เมื่อมี pilot และ revenue</p></div><div class="timeline"><div class="card phase"><b>MONTH 1-2</b><h3>MVP</h3><p>Portal, order intake, inventory ledger, LINE/Telegram alerts, first pilot</p></div><div class="card phase"><b>MONTH 3-4</b><h3>Paid beta</h3><p>Onboarding wizard, tenant templates, AI daily summary, error inbox</p></div><div class="card phase"><b>MONTH 5-6</b><h3>Reliability</h3><p>Postgres, queue, backups, monitoring, restore drills, audit exports</p></div><div class="card phase"><b>MONTH 7-12</b><h3>Scale</h3><p>Template marketplace, agency onboarding, enterprise isolation, Thai/EN switch</p></div></div></div></section>
   <section id="pricing" class="section"><div class="wrap"><div class="section-head"><h2>ราคาให้ SME ไทยกล้าลอง แต่โตไปกับระบบได้</h2><p class="sub">แพ็กเกจเริ่มจาก order + stock automation ก่อน แล้วค่อยขยายไป production ops, BOM, approval และ analytics</p></div><div class="pricing"><div class="card price"><h3>Starter</h3><p>เริ่มจัดระเบียบ order + stock</p><div class="amount">฿990–1,990</div><ul><li>1-2 sales channels</li><li>Inventory + stock ledger</li><li>Basic daily report</li><li>LINE/Telegram alert basic</li></ul></div><div class="card price featured"><h3>Growth</h3><p>สำหรับ seller/factory หลายช่องทาง</p><div class="amount">฿3,900–7,900</div><ul><li>Shopee, Lazada, TikTok, Facebook</li><li>Workflow templates</li><li>Low-stock + exception alerts</li><li>Setup support included</li></ul></div><div class="card price"><h3>Factory Ops</h3><p>สำหรับโรงงานที่ต้อง custom</p><div class="amount">฿12,000+</div><ul><li>Production task board</li><li>BOM/material checks</li><li>Approval workflows</li><li>Custom dashboard + priority support</li></ul></div></div></div></section>
