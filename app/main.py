@@ -1618,6 +1618,44 @@ const f=document.getElementById('orderForm'), r=document.getElementById('result'
 f.addEventListener('submit', async e=>{{e.preventDefault(); r.textContent='กำลังส่ง...'; const data=Object.fromEntries(new FormData(f).entries()); data.quantity=Number(data.quantity||1); try{{const res=await fetch('/api/successcasting/order',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(data)}}); const j=await res.json(); r.textContent=j.status==='ok'?(j.user_feedback || 'ส่งเข้าระบบแล้ว แจ้งทีมผ่าน LINE/Telegram สำเร็จ'):'ส่งไม่สำเร็จ'; if(j.status==='ok') f.reset();}}catch(err){{r.textContent='เชื่อมต่อไม่ได้ กรุณาลองใหม่';}} }});
 </script></body></html>"""
 
+
+@app.get("/api/trust-network/status")
+async def trust_network_status():
+    return {
+        "status": "pilot",
+        "brand_position": "Trusted SME Matchmaking Network, not ad-feed spam",
+        "pilot_sme": "SuccessCasting",
+        "pilot_verticals": ["pulley", "มู่เล่ย์", "foundry", "โรงหล่อ", "หล่อเหล็ก", "หล่อโลหะ", "machine spare parts"],
+        "trust_algorithm": {
+            "name": "TRUST Score",
+            "signals": {
+                "T_timing_intent": ["quote request", "deadline", "urgent repair", "first-party RFQ/chat/page intent"],
+                "R_relevance": ["capability match", "industry fit", "geography/logistics fit"],
+                "U_urgency_value": ["downtime", "quantity", "drawing/photo/sample", "repeat potential"],
+                "S_safety": ["scam/noise filter", "business identity", "contact validity", "policy compliance"],
+                "T_touch_strategy": ["warm consult", "helpful education", "nurture", "reject/quarantine"],
+            },
+        },
+        "data_policy": {
+            "private_social_search_history": "not available without consent/official APIs",
+            "first_party_intent_graph": "planned/active pilot from chat, RFQ, page events, LINE webhook, email replies, sales outcomes",
+            "facebook_linkedin": "official API or manual import only; no credential-gated scraping",
+        },
+        "customer_promise": "ลูกค้าได้รับ SME ที่คัดแล้ว มีหลักฐาน มืออาชีพ และข้อเสนอที่เกี่ยวข้องจริง",
+        "sme_promise": "SME ได้ intent-qualified opportunities พร้อม outreach playbook ไม่ใช่รายชื่อมั่ว",
+    }
+
+@app.get("/api/trust-network/successcasting-playbook")
+async def successcasting_trust_playbook():
+    return {
+        "status": "ok",
+        "pilot": "successcasting.com",
+        "target_jobs": ["pulley / มู่เล่ย์", "iron/steel casting", "custom machine spare part", "low-volume casting", "repair/maintenance replacement"],
+        "qualification_fields": ["work item", "material/grade", "size/weight", "shaft hole/keyway/groove", "quantity", "drawing/photo/sample", "deadline", "contact route"],
+        "professional_outreach_template": "สวัสดีครับ ผมติดต่อจาก SuccessCasting โรงหล่อ/งานหล่อโลหะและมู่เล่ย์ตามแบบครับ ที่ติดต่อเพราะเห็นว่าธุรกิจของคุณอยู่ในกลุ่มโรงงาน/เครื่องจักรที่อาจมีงานซ่อมบำรุงหรืออะไหล่หล่อตามแบบเป็นครั้งคราว ถ้าตอนนี้มีงานมู่เล่ย์ เหล็กหล่อ หรืออะไหล่เครื่องจักรที่ต้องทำจากตัวอย่าง/รูป/แบบ ทีมเราช่วยประเมินแนวทางผลิตเบื้องต้นได้ครับ คำถามเดียวเพื่อไม่รบกวน: ตอนนี้มีชิ้นงานที่ต้องการประเมินราคา/ผลิตภายใน 30-60 วันไหมครับ? ถ้ามี ส่งรูปหรือขนาดคร่าว ๆ ที่ LINE @SCNW ได้เลยครับ ถ้าไม่เกี่ยวข้องสามารถข้ามข้อความนี้ได้ครับ",
+        "do_not_do": ["do not spam LINE/DM", "do not claim false guarantees", "do not scrape private Facebook/LinkedIn", "do not auto-send without opt-out and throttling"],
+    }
+
 @app.get("/api/b2b/status")
 def b2b_status():
     init_customer_db()
@@ -1692,7 +1730,7 @@ HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <nav class="nav"><div class="wrap navin"><a class="brand" href="#top"><span class="mark"></span><span>Blutenstein</span></a><div class="links"><a href="#visibility">AI Visibility</a><a href="#platform">Platform</a><a href="#b2b-leads">B2B Leads</a><a href="#templates">Templates</a><a href="#roadmap">Roadmap</a><a href="#pricing">Pricing</a><a href="#connect" >Connect</a><a href="#demo" class="btn primary">ขอ Demo</a></div><a class="mobile btn primary" href="#demo">Demo</a></div></nav>
+  <nav class="nav"><div class="wrap navin"><a class="brand" href="#top"><span class="mark"></span><span>Blutenstein</span></a><div class="links"><a href="#visibility">AI Visibility</a><a href="#trust-network">Trusted SME</a><a href="#platform">Platform</a><a href="#b2b-leads">B2B Leads</a><a href="#templates">Templates</a><a href="#roadmap">Roadmap</a><a href="#pricing">Pricing</a><a href="#connect" >Connect</a><a href="#demo" class="btn primary">ขอ Demo</a></div><a class="mobile btn primary" href="#demo">Demo</a></div></nav>
   <main id="top" class="wrap">
     <section class="hero">
       <div class="orb one"></div><div class="orb two"></div>
@@ -1718,6 +1756,8 @@ HTML = """<!doctype html>
     </section>
   </main>
   <section id="visibility" class="section"><div class="wrap"><div class="section-head"><h2>AI Visibility Engine: ทำให้ SME ถูกเข้าใจโดย Google และ AI Search</h2><p class="sub">ระบบอ่านข้อมูลลูกค้าจริง สร้าง Business Knowledge Graph แล้วออกแบบ SEO/AEO/GEO pipeline: schema, service pages, FAQ, llms.txt, AI-readable profile และ internal Blutenstein AI Search index</p></div><div class="grid"><div class="card"><span class="num">01 / data graph</span><h3>เข้าใจธุรกิจจากข้อมูลจริง</h3><p>เชื่อม customer memory, catalog, lead history และ service map เพื่อให้ AI ไม่เขียนมั่ว และรู้ว่าลูกค้าขายอะไรจริง</p></div><div class="card"><span class="num">02 / ai seo</span><h3>SEO สำหรับยุค answer engine</h3><p>สร้าง service page, FAQ, schema.org, sitemap และ llms.txt ให้ทั้ง Google และ AI crawler อ่านง่าย</p></div><div class="card"><span class="num">03 / search guardian</span><h3>Draft → approve → publish</h3><p>AI admin ทำงานแบบ scoped permission มี audit log และต้อง approve ก่อน publish เพื่อความปลอดภัยของ SME</p></div></div><div class="hero-actions" style="margin-top:26px"><a class="btn primary" href="/api/visibility/status">Visibility API Status</a><a class="btn" href="/api/visibility/customers/successcasting/recommendations">SuccessCasting Recommendations</a><a class="btn" href="/api/visibility/customers/successcasting/llms.txt">SuccessCasting llms.txt</a></div></div></section>
+
+  <section id="trust-network" class="section"><div class="wrap"><div class="section-head"><span class="kicker">Trusted SME Network</span><h2>ไม่ใช่ feed โฆษณา — Blutenstein คัด SME ตัวจริงให้ลูกค้าเจอคนมืออาชีพที่ไว้ใจได้</h2><p class="sub">เราเปลี่ยนจาก sponsored spam เป็น trust matchmaking: ตรวจ SME, อ่าน intent ของลูกค้า, คัดงานที่ตรงจริง และส่งต่อแบบสุภาพพร้อมหลักฐาน ไม่ใช่หว่าน LINE หรือ DM มั่ว</p></div><div class="grid"><div class="card"><span class="num">T / timing</span><h3>Timing intent</h3><p>ดูว่าลูกค้ากำลังต้องการจริงหรือไม่: ขอราคา, ถามส่งงาน, มี deadline, มีรูป/แบบ, หรือมีสัญญาณจาก RFQ/chat/page visit</p></div><div class="card"><span class="num">R / relevance</span><h3>SME capability match</h3><p>จับคู่กับ SME ที่มีงานจริงตรงโจทย์ เช่น SuccessCasting สำหรับมู่เล่ย์, หล่อเหล็ก, อะไหล่เครื่องจักรตามแบบ</p></div><div class="card"><span class="num">U / urgency</span><h3>Value + urgency</h3><p>ให้คะแนนงานที่มีความเร่งด่วน มูลค่า และโอกาสปิดจริง ไม่ให้ทีมขายเสียเวลากับ lead ลอย ๆ</p></div><div class="card"><span class="num">S / safety</span><h3>Scam/noise filter</h3><p>กรอง lead เสี่ยง มิจฉาชีพ โปรไฟล์ไม่ชัด หรือ inquiry ที่ไม่ใช่งาน B2B จริง ก่อนส่งให้ SME</p></div><div class="card"><span class="num">T / touch</span><h3>Professional outreach</h3><p>agent เลือกวิธีติดต่อแบบสุภาพ: แนะนำตัวจริงใจ ถามหนึ่งคำถามที่มีประโยชน์ และให้ opt-out ไม่พ่นข้อความขายมั่ว</p></div><div class="card"><span class="num">proof / premium</span><h3>Evidence-backed offer</h3><p>ลูกค้าเห็นเหตุผลว่าทำไม SME นี้เหมาะ มีขอบเขตบริการ หลักฐานงาน และช่องทางติดต่อที่ตรวจแล้ว</p></div></div><div class="panel"><h3>SuccessCasting pilot</h3><p class="sub">เริ่มจากกลุ่มงาน Pulley / โรงหล่อ / หล่อเหล็ก: Blutenstein จะจัดกลุ่ม lead ตาม intent-depth แล้วส่งให้ LINE พร้อมเหตุผลและ next action ไม่ใช่แค่รายชื่อ</p></div></div></section>
   <section id="platform" class="section"><div class="wrap"><div class="section-head"><h2>Automation ที่เริ่มจาก pain จริง ไม่ใช่ dashboard สวยเฉย ๆ</h2><p class="sub">เราไม่ขาย ERP ก้อนใหญ่ เราขายระบบที่ทำให้เจ้าของรู้ทันทีว่า order เข้าไหม, stock ลดถูกไหม, อะไรต้องแก้ก่อนเสียเงิน</p></div><div class="grid"><div class="card"><span class="num">01 / ingest</span><h3>รวมออเดอร์หลายช่องทาง</h3><p>รับ webhook จาก marketplace แล้ว normalize ให้ทีมเห็น order format เดียว ไม่ต้อง copy/paste ระหว่างหลังบ้าน</p></div><div class="card"><span class="num">02 / ledger</span><h3>ตัดสต๊อกพร้อมหลักฐาน</h3><p>ทุก SKU movement ผูกกับ order_id, platform และเหตุผล ลดปัญหา stock ไม่ตรงแบบหาสาเหตุไม่ได้</p></div><div class="card"><span class="num">03 / alert</span><h3>แจ้งเตือนแบบมนุษย์อ่านรู้เรื่อง</h3><p>LINE/Telegram แจ้งเฉพาะเรื่องที่ต้องตัดสินใจ เช่น low stock, token fail, SKU mapping missing</p></div></div></div></section>
 
   <section id="b2b-leads" class="section"><div class="wrap"><div class="section-head"><span class="kicker">B2B Lead Engine</span><h2>ระบบหาลูกค้า B2B อัตโนมัติ เหมือนมีทีมเซลล์ทำงานทุกวัน</h2><p class="sub">Blutenstein ค้นหา lead ธุรกิจจากแผนที่/แหล่งข้อมูลสาธารณะ, คัดเฉพาะกลุ่มที่ตรง ICP, หา public contact email จากเว็บไซต์, ให้ AI เขียน outreach เฉพาะราย และ queue ส่งแบบปลอดภัย เมื่อ SMTP + auto-send flag พร้อมจึงส่งอัตโนมัติ</p></div><div class="grid"><div class="card"><span class="num">01 / find</span><h3>Lead discovery</h3><p>ค้นหาโรงงาน/SME/B2B ในพื้นที่เป้าหมายผ่าน Google Maps-ready link และ OpenStreetMap fallback โดยไม่ scrape credential-gated Facebook/LinkedIn</p></div><div class="card"><span class="num">02 / qualify</span><h3>ICP scoring</h3><p>ให้คะแนน lead จาก industry signal, website, phone, email, location และ keyword match เพื่อไม่ยิงมั่ว</p></div><div class="card"><span class="num">03 / write</span><h3>Personalized outreach</h3><p>AI เขียนอีเมลเฉพาะบริษัท อ้าง pain จริง: lead หลุด, Google/AI Search หาไม่เจอ, customer memory, RFQ/order automation</p></div><div class="card"><span class="num">04 / send</span><h3>Daily sales queue</h3><p>โหมดเริ่มต้นเป็น draft/queue เพื่อกัน spam; เปิด auto-send ได้เมื่อ SMTP, opt-out, limit และ policy พร้อม</p></div></div><div class="panel"><h3>Live API</h3><p class="sub"><code>POST /api/b2b/run</code> · <code>GET /api/b2b/status</code> · <code>GET /api/b2b/leads</code></p></div></div></section>
